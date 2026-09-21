@@ -62,6 +62,8 @@ sebagai daftar konfigurasi yang diperlukan.
 
 Snapshot disimpan sebagai JSON atomik pada `DATABASE_PATH` (default `data/tracker.json`). Snapshot mempertahankan pool, protocol, base fee, range saat open, umur posisi, alias wallet, serta nominal token dan nilai USD untuk alert penutupan.
 
+Enrichment pool (`TVL`, volume 24 jam, dan APR) diambil dari LP Agent hanya saat ada posisi baru, lalu disimpan bersama snapshot. Data tersebut digunakan kembali untuk alert penutupan. Cache in-memory memakai kunci `chain + protocol + pool ID` dengan TTL lima menit.
+
 Pengiriman utama memakai method Telegram `sendRichMessage` dengan rich HTML table. Jika method tersebut ditolak oleh endpoint Bot API, bot memakai pesan teks biasa sebagai fallback agar alert tidak hilang.
 
 Range persentase saat open dipulihkan dari log `add_liquidity` LP Agent. Jika log historis tidak tersedia, bot tetap mengirim alert tetapi menggunakan range saat ini sebagai fallback.

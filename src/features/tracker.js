@@ -122,8 +122,8 @@ export function formatShare(value) {
 
 function tokenInfo(raw, index) {
   const info = raw[`token${index}Info`] && typeof raw[`token${index}Info`] === "object" ? raw[`token${index}Info`] : {};
-  const symbol = String(raw[`tokenName${index}`] || info.token_symbol || info.symbol || raw[`token${index}`] || `token${index}`);
-  const name = String(raw[`tokenFullName${index}`] || info.token_name || info.name || symbol);
+  const symbol = String(info.token_symbol || info.symbol || raw[`tokenSymbol${index}`] || raw[`tokenName${index}`] || raw[`token${index}`] || `token${index}`);
+  const name = String(info.token_name || info.name || raw[`tokenFullName${index}`] || raw[`token_name${index}`] || raw[`name${index}`] || symbol);
   const decimals = Math.max(0, Math.trunc(number(raw[`decimal${index}`]) ?? number(info.token_decimals) ?? 18));
   return { symbol, name, decimals };
 }
@@ -263,14 +263,18 @@ function targetToken(raw, first, second) {
 }
 
 function winRateFromValue(value) {
-  const parsed = number(value);
+  const parsed = number(value) ?? (value && typeof value === "object" ? firstNumber(value, ["ALL", "all", "allTime", "ALL_TIME"]) : null);
   return parsed === null ? null : parsed <= 1 ? parsed * 100 : parsed;
 }
 
 function extractWinRate(value) {
   if (!value || typeof value !== "object") return null;
-  const direct = firstNumber(value, ["winRate", "win_rate", "winrate", "winningRate", "winning_rate", "winRatePercentage", "win_rate_percentage"]);
-  if (direct !== null) return winRateFromValue(direct);
+  for (const key of ["winRate", "win_rate", "winrate", "winningRate", "winning_rate", "winRatePercentage", "win_rate_percentage"]) {
+    if (value[key] !== undefined) {
+      const direct = winRateFromValue(value[key]);
+      if (direct !== null) return direct;
+    }
+  }
   for (const child of [value.data, value.overview, value.stats, value.walletStats, value.performance]) {
     const nested = extractWinRate(child);
     if (nested !== null) return nested;
@@ -301,6 +305,51 @@ export function baseFeeDisplay(raw) {
   return formatFeePercent(feePercentFromRaw(raw));
 }
 
+function positionPoolId(position) {
+  const raw = position?.raw || {};
+  return String(raw.poolId || raw.pool_id || raw.pool || raw.poolAddress || "").trim();
+}
+
+function protocolKeyFromPosition(position) {
+  const protocol = String(position?.raw?.protocol || "").toLowerCase();
+  return Object.hasOwn(PROTOCOL_NAMES, protocol) ? protocol : undefined;
+}
+
+function poolFeeFraction(pool) {
+  const fee = firstNumber(pool, ["fee", "base_fee", "baseFee"]);
+  if (fee === null) return null;
+  if (fee <= 1) return fee;
+  return fee / 1_000_000;
+}
+
+function poolMetricsFromApi(pool) {
+  if (!pool || typeof pool !== "object") return null;
+  const tvl = firstNumber(pool, ["tvl", "liquidity", "tvl_usd"]);
+  const volume24h = firstNumber(pool, ["vol_24h", "volume_24h", "volume24h"]);
+  const fee24h = firstNumber(pool, ["fee_24h", "fees_24h", "fee24h"]);
+  const ratio = firstNumber(pool, ["fee_tvl_ratio", "feeTvlRatio"]);
+  let apr = null;
+  let aprEstimated = false;
+  if (fee24h !== null && tvl !== null && tvl > 0) {
+    apr = (fee24h / tvl) * 365 * 100;
+  } else if (ratio !== null) {
+    apr = ratio * 365 * 100;
+  } else {
+    const feeFraction = poolFeeFraction(pool);
+    if (feeFraction !== null && volume24h !== null && tvl !== null && tvl > 0) {
+      apr = ((volume24h * feeFraction) / tvl) * 365 * 100;
+      aprEstimated = true;
+    }
+  }
+  return {
+    tvl,
+    volume24h,
+    apr,
+    aprEstimated,
+    updatedAt: nowIso(),
+  };
+}
+
 export function positionFromApi(raw, wallet, chain) {
   if (!raw || typeof raw !== "object") throw new TrackerError("Format posisi dari LP Agent tidak valid.");
   const positionId = String(raw.id ?? raw.position ?? `${raw.pool ?? "unknown-pool"}:${raw.tokenId ?? "unknown-token"}`);
@@ -327,6 +376,7 @@ export function positionFromApi(raw, wallet, chain) {
     rangeSource: "current",
     openedAt: createdAt ? createdAt.toISOString() : nowIso(),
     walletWinRate: extractWinRate(raw),
+    poolMetrics: null,
     investments: investmentRows(raw),
     raw,
   };
@@ -334,6 +384,13 @@ export function positionFromApi(raw, wallet, chain) {
 
 function needsInvestmentDetail(position) {
   return !Object.hasOwn(position.raw, "inputToken0") || !Object.hasOwn(position.raw, "inputToken1");
+}
+
+function needsTokenMetadata(position) {
+  return [0, 1].some((index) => {
+    const info = position.raw?.[`token${index}Info`];
+    return !info?.token_name && !info?.name && !position.raw?.[`tokenFullName${index}`] && !position.raw?.[`token_name${index}`] && !position.raw?.[`name${index}`];
+  });
 }
 
 function earliestAddLiquidity(logs) {
@@ -495,10 +552,13 @@ export class SnapshotStore {
 }
 
 export class LPAgentClient {
-  constructor(apiKey, { baseUrl = "https://api.lpagent.io/open-api/v1", timeoutMs = 30_000 } = {}) {
+  constructor(apiKey, { baseUrl = "https://api.lpagent.io/open-api/v1", timeoutMs = 30_000, poolCacheTtlMs = 5 * 60_000 } = {}) {
     this.apiKey = apiKey;
     this.baseUrl = baseUrl.replace(/\/$/, "");
     this.timeoutMs = timeoutMs;
+    this.poolCacheTtlMs = poolCacheTtlMs;
+    this.poolCache = new Map();
+    this.poolRequests = new Map();
     this.rateLimitUntil = 0;
   }
 
@@ -543,6 +603,37 @@ export class LPAgentClient {
     return payload.data || payload;
   }
 
+  async poolMetrics(position) {
+    const poolId = positionPoolId(position);
+    if (!poolId) return null;
+    const protocol = protocolKeyFromPosition(position);
+    const key = `${position.chain}|${protocol || "all"}|${poolId.toLowerCase()}`;
+    const cached = this.poolCache.get(key);
+    if (cached && cached.expiresAt > Date.now()) return cached.value;
+    if (this.poolRequests.has(key)) return this.poolRequests.get(key);
+    const request = (async () => {
+      const payload = await this.getJson("pools/discover", {
+        chain: position.chain,
+        search: poolId,
+        show_small_pools: "true",
+        ...(protocol ? { platform: protocol } : {}),
+        page: "1",
+        pageSize: "10",
+      });
+      const pools = Array.isArray(payload.data) ? payload.data : [];
+      const pool = pools.find((item) => String(item?.pool || "").toLowerCase() === poolId.toLowerCase()) || pools[0];
+      const value = poolMetricsFromApi(pool);
+      if (value) this.poolCache.set(key, { value, expiresAt: Date.now() + this.poolCacheTtlMs });
+      return value;
+    })();
+    this.poolRequests.set(key, request);
+    try {
+      return await request;
+    } finally {
+      this.poolRequests.delete(key);
+    }
+  }
+
   async positionDetail(positionId, wallet, chain) {
     const payload = await this.getJson("lp-positions/position", { position: positionId, chain });
     if (!payload.data || typeof payload.data !== "object") throw new ApiError("Detail posisi LP Agent tidak valid.");
@@ -556,7 +647,7 @@ export class LPAgentClient {
 
   async enrichPosition(position) {
     let enriched = position;
-    if (needsInvestmentDetail(enriched)) {
+    if (needsInvestmentDetail(enriched) || needsTokenMetadata(enriched)) {
       try {
         enriched = await this.positionDetail(position.positionId, position.wallet, position.chain);
       } catch (error) {
@@ -584,6 +675,16 @@ export class LPAgentClient {
       if (error.status === 429) return enriched;
     }
     return enriched;
+  }
+
+  async enrichPoolMetrics(position) {
+    try {
+      const metrics = await this.poolMetrics(position);
+      return metrics ? { ...position, poolMetrics: metrics } : position;
+    } catch (error) {
+      // Pool analytics are optional; an API failure must not suppress OPENED/CLOSED alerts.
+      return position;
+    }
   }
 }
 
@@ -652,13 +753,6 @@ export class LPTracker {
     const positions = current || await this.client.openingPositions(wallet.address, wallet.chain);
     const currentById = new Map(positions.map((position) => [position.positionId, position]));
     const existing = this.store.positions(wallet);
-    if (!this.store.isInitialized(wallet)) {
-      for (const position of currentById.values()) this.store.savePosition(wallet, await this.client.enrichPosition(position));
-      this.store.markInitialized(wallet);
-      return [];
-    }
-
-    const events = [];
     let walletWinRate;
     let overviewLoaded = false;
     const loadWalletWinRate = async () => {
@@ -672,16 +766,46 @@ export class LPTracker {
       }
       return walletWinRate;
     };
+    if (!this.store.isInitialized(wallet)) {
+      const overviewWinRate = await loadWalletWinRate();
+      for (const position of currentById.values()) {
+        const enriched = await this.client.enrichPosition(position);
+        this.store.savePosition(wallet, {
+          ...enriched,
+          walletName: wallet.name,
+          walletEmoji: wallet.emoji,
+          walletWinRate: overviewWinRate ?? enriched.walletWinRate,
+        });
+      }
+      this.store.markInitialized(wallet);
+      return [];
+    }
+
+    const events = [];
     for (const [positionId, saved] of Object.entries(existing)) {
       if (saved.active && !currentById.has(positionId)) {
         this.store.markClosed(wallet, positionId);
-        events.push({ chatId: wallet.chatId, eventType: "CLOSED", position: saved.position });
+        const winRate = saved.position.walletWinRate ?? await loadWalletWinRate();
+        const closedPosition = !saved.position.poolMetrics && typeof this.client.enrichPoolMetrics === "function"
+          ? await this.client.enrichPoolMetrics(saved.position)
+          : saved.position;
+        events.push({
+          chatId: wallet.chatId,
+          eventType: "CLOSED",
+          position: {
+            ...closedPosition,
+            walletName: wallet.name,
+            walletEmoji: wallet.emoji,
+            walletWinRate: winRate,
+          },
+        });
       }
     }
     for (const [positionId, position] of currentById.entries()) {
       const previous = existing[positionId];
       if (!previous || !previous.active) {
-        const enriched = await this.client.enrichPosition(position);
+        let enriched = await this.client.enrichPosition(position);
+        if (typeof this.client.enrichPoolMetrics === "function") enriched = await this.client.enrichPoolMetrics(enriched);
         const winRate = (await loadWalletWinRate()) ?? enriched.walletWinRate;
         const eventPosition = { ...enriched, walletName: wallet.name, walletEmoji: wallet.emoji, walletWinRate: winRate };
         this.store.savePosition(wallet, eventPosition);
@@ -722,7 +846,7 @@ function eventRangeParts(position) {
 
 function shortWallet(address) {
   const value = String(address || "-");
-  return value.length > 12 ? `${value.slice(0, 6)}...${value.slice(-4)}` : value;
+  return value.length > 10 ? `${value.slice(0, 5)}...${value.slice(-3)}` : value;
 }
 
 function eventToken(position) {
@@ -748,11 +872,22 @@ function eventBaseFee(position) {
   return position.baseFee || baseFeeDisplay(position.raw || {});
 }
 
+function eventPoolMetrics(position) {
+  return position.poolMetrics || {};
+}
+
+function eventApr(position) {
+  const metrics = eventPoolMetrics(position);
+  if (metrics.apr === null || metrics.apr === undefined || !Number.isFinite(metrics.apr)) return "-";
+  return `${metrics.aprEstimated ? "~" : ""}${formatPercent(metrics.apr)}`;
+}
+
 export function renderEventText(event, now = new Date()) {
   const { position } = event;
   const chain = position.chain === "ROBINHOOD" ? "Robinhood" : "SOL";
   const token = eventToken(position);
   const range = eventRangeParts(position);
+  const metrics = eventPoolMetrics(position);
   const lines = [
     `${eventTitle(event.eventType)} ${token.ticker} ${token.name}`,
     "",
@@ -764,6 +899,9 @@ export function renderEventText(event, now = new Date()) {
     `♻️ Protocol | ${position.protocol}`,
     `💦 Pool | ${position.pool}`,
     `💸 Base fee | ${eventBaseFee(position)}`,
+    `📊 TVL | ${formatUsd(metrics.tvl)}`,
+    `📈 Volume 24h | ${formatUsd(metrics.volume24h)}`,
+    `🚀 APR | ${eventApr(position)}`,
     "",
     "📌 Detail",
     ...position.investments.map((item, index) => `${index === 0 ? "💶" : "💷"} ${item.symbol} | ${formatAmount(item.amount)} | ${formatUsd(item.usdValue)}`),
@@ -779,6 +917,7 @@ export function renderEventHtml(event, now = new Date()) {
   const chain = position.chain === "ROBINHOOD" ? "Robinhood" : "SOL";
   const token = eventToken(position);
   const range = eventRangeParts(position);
+  const metrics = eventPoolMetrics(position);
   const rows = position.investments.length
     ? position.investments.map((item, index) => `<tr><td>${index === 0 ? "💶" : "💷"} ${escapeHtml(item.symbol)}</td><td>${escapeHtml(formatAmount(item.amount))}</td><td>${escapeHtml(formatUsd(item.usdValue))}</td></tr>`).join("")
     : "<tr><td colspan='3'>-</td></tr>";
@@ -786,10 +925,10 @@ export function renderEventHtml(event, now = new Date()) {
     `<h2>${eventTitle(event.eventType)} <b>${escapeHtml(token.ticker)}</b> ${escapeHtml(token.name)}</h2>`,
     "<hr>",
     "<h3>👝 Wallet</h3>",
-    `<table><tr><th></th><th>Wallet</th><th>Name</th><th>Win rate</th></tr><tr><td>${escapeHtml(eventWalletEmoji(position))}</td><td><code>${escapeHtml(shortWallet(position.wallet))}</code></td><td>${escapeHtml(eventWalletName(position))}</td><td>${escapeHtml(eventWinRate(position))}</td></tr></table>`,
+    `<table><tr><th>Emoji</th><th>Wallet</th><th>Name</th><th>Win rate</th></tr><tr><td>${escapeHtml(eventWalletEmoji(position))}</td><td><code>${escapeHtml(shortWallet(position.wallet))}</code></td><td>${escapeHtml(eventWalletName(position))}</td><td>${escapeHtml(eventWinRate(position))}</td></tr></table>`,
     "<hr>",
     "<h3>💧 Pool</h3>",
-    `<table><tr><th>Name</th><th>Value</th></tr><tr><td>🔗 Chain</td><td>${escapeHtml(chain)}</td></tr><tr><td>♻️ Protocol</td><td>${escapeHtml(position.protocol)}</td></tr><tr><td>💦 Pool</td><td>${escapeHtml(position.pool)}</td></tr><tr><td>💸 Base fee</td><td>${escapeHtml(eventBaseFee(position))}</td></tr></table>`,
+    `<table><tr><th>Name</th><th>Value</th></tr><tr><td>🔗 Chain</td><td>${escapeHtml(chain)}</td></tr><tr><td>♻️ Protocol</td><td>${escapeHtml(position.protocol)}</td></tr><tr><td>💦 Pool</td><td>${escapeHtml(position.pool)}</td></tr><tr><td>💸 Base fee</td><td>${escapeHtml(eventBaseFee(position))}</td></tr><tr><td>📊 TVL</td><td>${escapeHtml(formatUsd(metrics.tvl))}</td></tr><tr><td>📈 Volume 24h</td><td>${escapeHtml(formatUsd(metrics.volume24h))}</td></tr><tr><td>🚀 APR</td><td>${escapeHtml(eventApr(position))}</td></tr></table>`,
     "<hr>",
     "<h3>📌 Detail</h3>",
     `<table><tr><th>Name</th><th>Value</th><th>USD</th></tr>${rows}<tr><td>🏷 Range</td><td>${escapeHtml(range.plus)}</td><td>${escapeHtml(range.minus)}</td></tr></table>`,

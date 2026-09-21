@@ -41,15 +41,16 @@ function apiPosition(positionId, symbol0 = "WETH", symbol1 = "musebook") {
 }
 
 class FakeClient {
-  constructor(items = []) { this.items = items; }
+  constructor(items = [], overview = null) { this.items = items; this.overview = overview; }
   async openingPositions(address, chain) { return this.items.map((item) => positionFromApi(item, address, chain)); }
   async enrichPosition(position) { return position; }
+  async walletOverview() { return this.overview; }
 }
 
-function makeTracker(items) {
+function makeTracker(items, overview = null) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "lp-tracker-"));
   const store = new SnapshotStore(path.join(directory, "tracker.json"));
-  const client = new FakeClient(items);
+  const client = new FakeClient(items, overview);
   const tracker = new LPTracker(client, store);
   return { directory, store, client, tracker };
 }
@@ -126,6 +127,15 @@ test("shows musebook regardless of pair orientation", () => {
   assert.deepEqual(position.targetToken, { ticker: "musebook", name: "musebook" });
 });
 
+test("uses token name separately from ticker", () => {
+  const raw = apiPosition("p1", "HYPE", "USDG");
+  raw.token0Info = { token_symbol: "HYPE", token_name: "Hyperliquid", token_decimals: 18 };
+  raw.token1Info = { token_symbol: "USDG", token_name: "USDG", token_decimals: 6 };
+  const position = positionFromApi(raw, WALLET, "ROBINHOOD");
+  assert.deepEqual(position.targetToken, { ticker: "HYPE", name: "Hyperliquid" });
+  assert.match(renderEventHtml({ eventType: "OPENED", chatId: 1, position }), /<b>HYPE<\/b> Hyperliquid/);
+});
+
 test("selects the non-quote token when the pair is reversed", () => {
   const raw = apiPosition("p1", "USDG", "TOKENA");
   const position = positionFromApi(raw, WALLET, "ROBINHOOD");
@@ -150,6 +160,49 @@ test("lists and removes tracked wallets by stable ID, name, address, or all", as
   assert.equal(tracker.remove(10, "Alpha").length, 1);
   assert.equal(tracker.remove(10, secondWallet).length, 1);
   assert.equal(tracker.list(10).length, 0);
+});
+
+test("keeps wallet emoji and win rate on close alerts", async () => {
+  const { tracker, client } = makeTracker([apiPosition("p1")], { win_rate: { ALL: 0.625 } });
+  await tracker.register(10, WALLET, "Alpha", "🦊");
+  client.items = [];
+  const [event] = await tracker.syncAll();
+  assert.equal(event.eventType, "CLOSED");
+  assert.equal(event.position.walletEmoji, "🦊");
+  assert.equal(event.position.walletWinRate, 62.5);
+  assert.match(renderEventHtml(event), /<th>Emoji<\/th>/);
+  assert.match(renderEventHtml(event), /62\.5%/);
+  assert.match(renderEventHtml(event), /0xaaa\.\.\.aaa/);
+});
+
+test("caches pool enrichment and renders TVL, volume, and APR", async () => {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return new Response(JSON.stringify({
+      status: "success",
+      data: [{ pool: "0xpool", tvl: 1000, vol_24h: 2000, fee_24h: 10.5 }],
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  try {
+    const raw = apiPosition("p1");
+    raw.pool = "0xpool";
+    const position = positionFromApi(raw, WALLET, "ROBINHOOD");
+    const client = new LPAgentClient("test-key", { baseUrl: "https://api.test", poolCacheTtlMs: 10_000 });
+    const first = await client.poolMetrics(position);
+    const second = await client.poolMetrics(position);
+    assert.equal(calls, 1);
+    assert.equal(first.apr, 383.25);
+    assert.deepEqual(second, first);
+    const enriched = await client.enrichPoolMetrics(position);
+    const html = renderEventHtml({ eventType: "OPENED", chatId: 1, position: enriched });
+    assert.match(html, /TVL/);
+    assert.match(html, /Volume 24h/);
+    assert.match(html, /383\.3%/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("uses opening timestamp for age", () => {
