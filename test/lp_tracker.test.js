@@ -17,6 +17,7 @@ import {
   baseFeeDisplay,
   renderEventHtml,
   renderEventText,
+  renderTrackListHtml,
 } from "../src/features/tracker.js";
 
 const WALLET = `0x${"a".repeat(40)}`;
@@ -137,6 +138,18 @@ test("formats Uniswap V4 base fee in percent units", () => {
   assert.equal(baseFeeDisplay(raw), "1%");
   raw.poolInfo.fee = 10010;
   assert.equal(baseFeeDisplay(raw), "1.001%");
+});
+
+test("lists and removes tracked wallets by stable ID, name, address, or all", async () => {
+  const { tracker } = makeTracker([]);
+  const secondWallet = `0x${"b".repeat(40)}`;
+  await tracker.register(10, WALLET, "Alpha", "🦊");
+  await tracker.register(10, secondWallet, "Beta", "🐻");
+  assert.deepEqual(tracker.list(10).map((wallet) => [wallet.id, wallet.name]), [[1, "Alpha"], [2, "Beta"]]);
+  assert.match(renderTrackListHtml(tracker.list(10)), /Alpha/);
+  assert.equal(tracker.remove(10, "Alpha").length, 1);
+  assert.equal(tracker.remove(10, secondWallet).length, 1);
+  assert.equal(tracker.list(10).length, 0);
 });
 
 test("uses opening timestamp for age", () => {

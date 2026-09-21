@@ -36,6 +36,8 @@ Command bot:
 
 ```text
 /track <address> <name> <emoji>
+/track-list
+/track-remove <id|address|name|all>
 
 Chain dideteksi otomatis dari alamat EVM (`ROBINHOOD`) atau Solana (`SOL`). Nama dan emoji disimpan bersama wallet dan dipakai pada alert.
 ```

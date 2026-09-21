@@ -352,10 +352,29 @@ export class SnapshotStore {
   load() {
     try {
       const value = JSON.parse(fs.readFileSync(this.filePath, "utf8"));
-      return { trackedWallets: value.trackedWallets || {}, positions: value.positions || {} };
+      const state = {
+        trackedWallets: value.trackedWallets || {},
+        positions: value.positions || {},
+        nextWalletId: value.nextWalletId || {},
+      };
+      const highestByChat = {};
+      for (const wallet of Object.values(state.trackedWallets)) {
+        const chatId = String(wallet.chatId);
+        const existingId = Number(wallet.id);
+        if (Number.isInteger(existingId) && existingId > 0) highestByChat[chatId] = Math.max(highestByChat[chatId] || 0, existingId);
+      }
+      for (const wallet of Object.values(state.trackedWallets)) {
+        const chatId = String(wallet.chatId);
+        if (!Number.isInteger(Number(wallet.id)) || Number(wallet.id) < 1) {
+          highestByChat[chatId] = (highestByChat[chatId] || 0) + 1;
+          wallet.id = highestByChat[chatId];
+        }
+        state.nextWalletId[chatId] = Math.max(Number(state.nextWalletId[chatId]) || 0, Number(wallet.id));
+      }
+      return state;
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
-      return { trackedWallets: {}, positions: {} };
+      return { trackedWallets: {}, positions: {}, nextWalletId: {} };
     }
   }
 
@@ -392,13 +411,48 @@ export class SnapshotStore {
       }
       return false;
     }
-    this.state.trackedWallets[key] = { chatId, address, chain, name, emoji, initialized: false, createdAt: nowIso() };
+    const chatKey = String(chatId);
+    const id = (Number(this.state.nextWalletId[chatKey]) || 0) + 1;
+    this.state.nextWalletId[chatKey] = id;
+    this.state.trackedWallets[key] = { id, chatId, address, chain, name, emoji, initialized: false, createdAt: nowIso() };
     this.persist();
     return true;
   }
 
   wallets() {
-    return Object.values(this.state.trackedWallets).map(({ chatId, address, chain, name = "Wallet", emoji = "👝" }) => ({ chatId, address, chain, name, emoji }));
+    return Object.values(this.state.trackedWallets).map(({ id, chatId, address, chain, name = "Wallet", emoji = "👝" }) => ({ id, chatId, address, chain, name, emoji }));
+  }
+
+  walletsForChat(chatId) {
+    return this.wallets().filter((wallet) => String(wallet.chatId) === String(chatId));
+  }
+
+  removeWallet(wallet) {
+    const key = this.walletKey(wallet.chatId, wallet.address, wallet.chain);
+    if (!this.state.trackedWallets[key]) return false;
+    delete this.state.trackedWallets[key];
+    const prefix = `${key}|`;
+    for (const positionKey of Object.keys(this.state.positions)) {
+      if (positionKey.startsWith(prefix)) delete this.state.positions[positionKey];
+    }
+    this.persist();
+    return true;
+  }
+
+  removeWallets(chatId, selector) {
+    const value = String(selector || "").trim();
+    const wallets = this.walletsForChat(chatId);
+    let matches;
+    if (value.toLowerCase() === "all") {
+      matches = wallets;
+    } else {
+      const lower = value.toLowerCase();
+      matches = wallets.filter((wallet) => String(wallet.id) === value
+        || wallet.address.toLowerCase() === lower
+        || String(wallet.name).toLowerCase() === lower);
+    }
+    for (const wallet of matches) this.removeWallet(wallet);
+    return matches;
   }
 
   isInitialized(wallet) {
@@ -553,6 +607,17 @@ export class LPTracker {
       }
     }
     return { wallet, added, warning: null };
+  }
+
+  list(chatId) {
+    return this.store.walletsForChat(chatId).map((wallet) => ({
+      ...wallet,
+      activePositions: Object.values(this.store.positions(wallet)).filter((item) => item.active).length,
+    }));
+  }
+
+  remove(chatId, selector) {
+    return this.store.removeWallets(chatId, selector);
   }
 
   async syncAll() {
@@ -732,6 +797,34 @@ export function renderEventHtml(event, now = new Date()) {
   ].join("");
 }
 
+export function renderTrackListHtml(wallets) {
+  const rows = wallets.length
+    ? wallets.map((wallet) => `<tr><td>${escapeHtml(wallet.id)}</td><td>${escapeHtml(wallet.emoji)}</td><td><code>${escapeHtml(shortWallet(wallet.address))}</code></td><td>${escapeHtml(wallet.name)}</td><td>${escapeHtml(wallet.chain === "ROBINHOOD" ? "Robinhood" : "SOL")}</td><td>${escapeHtml(wallet.activePositions ?? 0)}</td></tr>`).join("")
+    : "<tr><td colspan='6'>Belum ada wallet yang di-track.</td></tr>";
+  return [
+    "<h2>📋 Track List</h2>",
+    `<table><tr><th>ID</th><th></th><th>Wallet</th><th>Name</th><th>Chain</th><th>LP aktif</th></tr>${rows}</table>`,
+  ].join("");
+}
+
+export function renderTrackListText(wallets) {
+  if (!wallets.length) return "📋 Track List\n\nBelum ada wallet yang di-track.";
+  return [
+    "📋 Track List",
+    "",
+    ...wallets.map((wallet) => `${wallet.id} | ${wallet.emoji} | ${shortWallet(wallet.address)} | ${wallet.name} | ${wallet.chain === "ROBINHOOD" ? "Robinhood" : "SOL"} | LP aktif: ${wallet.activePositions ?? 0}`),
+  ].join("\n");
+}
+
+export function renderTrackRemoveHtml(wallets) {
+  const rows = wallets.map((wallet) => `<tr><td>${escapeHtml(wallet.id)}</td><td>${escapeHtml(wallet.emoji)}</td><td><code>${escapeHtml(shortWallet(wallet.address))}</code></td><td>${escapeHtml(wallet.name)}</td></tr>`).join("");
+  return `<h2>✅ Tracking Removed</h2><table><tr><th>ID</th><th></th><th>Wallet</th><th>Name</th></tr>${rows}</table>`;
+}
+
+export function renderTrackRemoveText(wallets) {
+  return ["✅ Tracking removed", "", ...wallets.map((wallet) => `${wallet.id} | ${wallet.emoji} | ${shortWallet(wallet.address)} | ${wallet.name}`)].join("\n");
+}
+
 export class TelegramClient {
   constructor(botToken, { timeoutMs = 45_000 } = {}) {
     this.baseUrl = `https://api.telegram.org/bot${botToken}`;
@@ -767,12 +860,24 @@ export class TelegramClient {
     await this.call("sendMessage", { chat_id: chatId, text });
   }
 
-  async sendRichEvent(event) {
+  async sendRichHtml(chatId, html, fallbackText) {
     try {
-      await this.call("sendRichMessage", { chat_id: event.chatId, rich_message: { html: renderEventHtml(event) } });
+      await this.call("sendRichMessage", { chat_id: chatId, rich_message: { html } });
     } catch {
-      await this.sendText(event.chatId, renderEventText(event));
+      await this.sendText(chatId, fallbackText);
     }
+  }
+
+  async sendRichTrackList(chatId, wallets) {
+    await this.sendRichHtml(chatId, renderTrackListHtml(wallets), renderTrackListText(wallets));
+  }
+
+  async sendRichTrackRemoved(chatId, wallets) {
+    await this.sendRichHtml(chatId, renderTrackRemoveHtml(wallets), renderTrackRemoveText(wallets));
+  }
+
+  async sendRichEvent(event) {
+    await this.sendRichHtml(event.chatId, renderEventHtml(event), renderEventText(event));
   }
 }
 
@@ -825,12 +930,27 @@ export async function runBot() {
         const text = String(message.text || "").trim();
         const chatId = message.chat?.id;
         if (chatId === undefined || !isAllowedUser(message.from?.id, allowedUserIds)) continue;
-        if (text.startsWith("/start")) {
+        const args = text.split(/\s+/);
+        const command = String(args[0] || "").toLowerCase().split("@")[0];
+        if (command === "/start") {
           await telegram.sendText(chatId, "Kirim /track <address> <name> <emoji> untuk mulai memantau posisi LP.");
           continue;
         }
-        if (!text.startsWith("/track")) continue;
-        const args = text.split(/\s+/);
+        if (command === "/track-list") {
+          await telegram.sendRichTrackList(chatId, tracker.list(chatId));
+          continue;
+        }
+        if (command === "/track-remove") {
+          if (args.length !== 2) {
+            await telegram.sendText(chatId, "Format: /track-remove <id|address|name|all>");
+            continue;
+          }
+          const removed = tracker.remove(chatId, args[1]);
+          if (removed.length) await telegram.sendRichTrackRemoved(chatId, removed);
+          else await telegram.sendText(chatId, "Tracking tidak ditemukan.");
+          continue;
+        }
+        if (command !== "/track") continue;
         if (![3, 4].includes(args.length)) {
           await telegram.sendText(chatId, "Format: /track <address> <name> <emoji>");
           continue;
