@@ -1,4 +1,4 @@
-# LP Wallet Tracker
+# MTG Tools
 
 Bot Telegram minimal untuk memantau posisi LP baru dibuka dan ditutup pada Solana atau Robinhood Chain.
 

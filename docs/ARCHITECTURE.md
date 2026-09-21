@@ -9,7 +9,7 @@ dan tidak bercampur dengan konfigurasi atau dokumentasi.
 │   ├── bot.js                  # entrypoint runtime bot
 │   └── features/
 │       ├── README.md           # aturan penulisan modul fitur
-│       └── tracker.js          # fitur pertama: LP wallet tracker
+│       └── tracker.js          # fitur pertama: LP wallet tracking
 ├── test/                       # automated tests, satu file per fitur
 ├── docs/                       # dokumentasi teknis dan keputusan struktur
 ├── data/                       # data runtime lokal (di-ignore Git)
