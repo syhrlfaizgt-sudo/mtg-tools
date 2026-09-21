@@ -14,6 +14,7 @@ import {
   openingRangeDisplay,
   parseAllowedUserIds,
   positionFromApi,
+  baseFeeDisplay,
   renderEventHtml,
   renderEventText,
 } from "../src/features/tracker.js";
@@ -113,8 +114,29 @@ test("renders rich alert with exact investment shares", () => {
   };
   const event = { chatId: 1, eventType: "OPENED", position };
   assert.match(renderEventHtml(event), /<table>/);
-  assert.match(renderEventHtml(event), /97\.58%/);
-  assert.match(renderEventText(event), /Range: -70%/);
+  assert.match(renderEventHtml(event), /WETH/);
+  assert.match(renderEventHtml(event), /Base fee/);
+  assert.match(renderEventText(event), /Range \| - \| -70%/);
+});
+
+test("shows musebook regardless of pair orientation", () => {
+  const raw = apiPosition("p1", "musebook", "WETH");
+  const position = positionFromApi(raw, WALLET, "ROBINHOOD");
+  assert.deepEqual(position.targetToken, { ticker: "musebook", name: "musebook" });
+});
+
+test("selects the non-quote token when the pair is reversed", () => {
+  const raw = apiPosition("p1", "USDG", "TOKENA");
+  const position = positionFromApi(raw, WALLET, "ROBINHOOD");
+  assert.deepEqual(position.targetToken, { ticker: "TOKENA", name: "TOKENA" });
+});
+
+test("formats Uniswap V4 base fee in percent units", () => {
+  const raw = apiPosition("p1");
+  raw.poolInfo = { fee: 10000 };
+  assert.equal(baseFeeDisplay(raw), "1%");
+  raw.poolInfo.fee = 10010;
+  assert.equal(baseFeeDisplay(raw), "1.001%");
 });
 
 test("uses opening timestamp for age", () => {

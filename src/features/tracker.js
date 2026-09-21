@@ -123,8 +123,9 @@ export function formatShare(value) {
 function tokenInfo(raw, index) {
   const info = raw[`token${index}Info`] && typeof raw[`token${index}Info`] === "object" ? raw[`token${index}Info`] : {};
   const symbol = String(raw[`tokenName${index}`] || info.token_symbol || info.symbol || raw[`token${index}`] || `token${index}`);
+  const name = String(raw[`tokenFullName${index}`] || info.token_name || info.name || symbol);
   const decimals = Math.max(0, Math.trunc(number(raw[`decimal${index}`]) ?? number(info.token_decimals) ?? 18));
-  return { symbol, decimals };
+  return { symbol, name, decimals };
 }
 
 function adjustedInputAmount(raw, index, decimals) {
@@ -156,7 +157,22 @@ function rangeFromPercentList(value) {
   return null;
 }
 
-export function rangeFromPrices(priceRange, referencePrice) {
+function rangePartsFromPercentList(value) {
+  if (!Array.isArray(value)) return null;
+  const values = value.map(number).filter((item) => item !== null);
+  if (!values.length) return null;
+  const positive = values.filter((item) => item >= 0).sort((a, b) => b - a)[0];
+  const negative = values.filter((item) => item < 0).sort((a, b) => a - b)[0];
+  return { plus: positive === undefined ? "-" : formatSignedPercent(positive), minus: negative === undefined ? "-" : formatSignedPercent(negative) };
+}
+
+function formatSignedPercent(value) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return "-";
+  const rounded = Number(value.toFixed(1));
+  return `${rounded > 0 ? "+" : ""}${rounded}%`;
+}
+
+function rangePartsFromPrices(priceRange, referencePrice) {
   if (!Array.isArray(priceRange) || priceRange.length < 2) return null;
   const lower = number(priceRange[0]);
   const upper = number(priceRange[1]);
@@ -164,10 +180,19 @@ export function rangeFromPrices(priceRange, referencePrice) {
   if (current === null || current === 0) return null;
   const lowerPct = lower !== null && lower > 0 ? ((lower / current) - 1) * 100 : null;
   const upperPct = upper !== null && upper > 0 ? ((upper / current) - 1) * 100 : null;
-  if (lowerPct !== null && upperPct !== null) return `${formatPercent(lowerPct)} to ${formatPercent(upperPct)}`;
-  if (lowerPct !== null) return formatPercent(lowerPct);
-  if (upperPct !== null) return formatPercent(upperPct);
-  return null;
+  const values = [lowerPct, upperPct].filter((item) => item !== null);
+  if (!values.length) return null;
+  const positive = values.filter((item) => item >= 0).sort((a, b) => b - a)[0];
+  const negative = values.filter((item) => item < 0).sort((a, b) => a - b)[0];
+  return {
+    display: values.length === 1 ? formatPercent(values[0]) : `${formatPercent(lowerPct)} to ${formatPercent(upperPct)}`,
+    plus: positive === undefined ? "-" : formatSignedPercent(positive),
+    minus: negative === undefined ? "-" : formatSignedPercent(negative),
+  };
+}
+
+export function rangeFromPrices(priceRange, referencePrice) {
+  return rangePartsFromPrices(priceRange, referencePrice)?.display || null;
 }
 
 export function currentRangeDisplay(raw) {
@@ -178,9 +203,21 @@ export function currentRangeDisplay(raw) {
   return rangeFromPrices(raw.priceRange, undefined) || (raw.rangeDisplay ? String(raw.rangeDisplay) : "-");
 }
 
+function currentRangeParts(raw) {
+  for (const key of ["rangePercent", "range_percent", "rangePercentage"]) {
+    const parts = rangePartsFromPercentList(raw[key]);
+    if (parts) return parts;
+  }
+  return rangePartsFromPrices(raw.priceRange, undefined) || { plus: "-", minus: "-" };
+}
+
 export function openingRangeDisplay(raw, openingLog) {
   const openingPrice = number(openingLog?.price0);
   return rangeFromPrices(raw?.priceRange, openingPrice);
+}
+
+function openingRangeParts(raw, openingLog) {
+  return rangePartsFromPrices(raw?.priceRange, number(openingLog?.price0));
 }
 
 function investmentRows(raw) {
@@ -202,6 +239,68 @@ function investmentRows(raw) {
     }));
 }
 
+function tokenMatchesTarget(token) {
+  return [token?.symbol, token?.name].some((value) => String(value || "").toLowerCase() === "musebook");
+}
+
+const QUOTE_TOKEN_SYMBOLS = new Set(["eth", "weth", "usdg", "usdc", "usdt", "sol"]);
+
+function tokenLooksLikeQuote(token) {
+  return [token?.symbol, token?.name].some((value) => QUOTE_TOKEN_SYMBOLS.has(String(value || "").toLowerCase()));
+}
+
+function targetToken(raw, first, second) {
+  const selected = tokenMatchesTarget(first)
+    ? first
+    : tokenMatchesTarget(second)
+      ? second
+      : tokenLooksLikeQuote(first) && !tokenLooksLikeQuote(second)
+        ? second
+        : tokenLooksLikeQuote(second) && !tokenLooksLikeQuote(first)
+          ? first
+          : first;
+  return { ticker: selected.symbol, name: selected.name };
+}
+
+function winRateFromValue(value) {
+  const parsed = number(value);
+  return parsed === null ? null : parsed <= 1 ? parsed * 100 : parsed;
+}
+
+function extractWinRate(value) {
+  if (!value || typeof value !== "object") return null;
+  const direct = firstNumber(value, ["winRate", "win_rate", "winrate", "winningRate", "winning_rate", "winRatePercentage", "win_rate_percentage"]);
+  if (direct !== null) return winRateFromValue(direct);
+  for (const child of [value.data, value.overview, value.stats, value.walletStats, value.performance]) {
+    const nested = extractWinRate(child);
+    if (nested !== null) return nested;
+  }
+  return null;
+}
+
+function feePercentFromRaw(raw) {
+  const feeInfo = raw?.feeInfo && typeof raw.feeInfo === "object" ? raw.feeInfo : {};
+  const direct = firstNumber(feeInfo, ["baseFeeRatePercentage", "base_fee_rate_percentage", "baseFeePercentage"]);
+  if (direct !== null) return direct;
+  const protocol = String(raw?.protocol || "").toLowerCase();
+  const poolInfo = raw?.poolInfo && typeof raw.poolInfo === "object" ? raw.poolInfo : {};
+  const rawFee = firstNumber(poolInfo, ["baseFeeRatePercentage", "base_fee_rate_percentage", "baseFeePercentage"]);
+  if (rawFee !== null) return rawFee;
+  const fee = firstNumber(poolInfo, ["fee", "feeRate", "fee_rate"]);
+  if (fee === null) return null;
+  if (protocol === "uniswap_v3" || protocol === "uniswap_v4") return fee / 10_000;
+  return fee <= 1 ? fee * 100 : fee;
+}
+
+function formatFeePercent(value) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return "-";
+  return `${Number(value.toFixed(3)).toString()}%`;
+}
+
+export function baseFeeDisplay(raw) {
+  return formatFeePercent(feePercentFromRaw(raw));
+}
+
 export function positionFromApi(raw, wallet, chain) {
   if (!raw || typeof raw !== "object") throw new TrackerError("Format posisi dari LP Agent tidak valid.");
   const positionId = String(raw.id ?? raw.position ?? `${raw.pool ?? "unknown-pool"}:${raw.tokenId ?? "unknown-token"}`);
@@ -210,16 +309,24 @@ export function positionFromApi(raw, wallet, chain) {
   const pairName = raw.pairName && String(raw.pairName).includes("/") ? String(raw.pairName) : `${first.symbol} / ${second.symbol}`;
   const protocolKey = String(raw.protocol ?? "").toLowerCase();
   const createdAt = parseTimestamp(raw.createdAt);
+  const rangeParts = currentRangeParts(raw);
   return {
     positionId,
     wallet,
     chain,
     pool: pairName,
     protocol: PROTOCOL_NAMES[protocolKey] || String(raw.protocol || "Unknown"),
+    targetToken: targetToken(raw, first, second),
+    baseFee: baseFeeDisplay(raw),
     currentRangeDisplay: currentRangeDisplay(raw),
+    currentRangePlus: rangeParts.plus,
+    currentRangeMinus: rangeParts.minus,
     openingRangeDisplay: null,
+    openingRangePlus: null,
+    openingRangeMinus: null,
     rangeSource: "current",
     openedAt: createdAt ? createdAt.toISOString() : nowIso(),
+    walletWinRate: extractWinRate(raw),
     investments: investmentRows(raw),
     raw,
   };
@@ -266,16 +373,32 @@ export class SnapshotStore {
     return `${this.walletKey(wallet.chatId, wallet.address, wallet.chain)}|${positionId}`;
   }
 
-  addWallet(chatId, address, chain) {
+  addWallet(chatId, address, chain, name = "Wallet", emoji = "👝") {
     const key = this.walletKey(chatId, address, chain);
-    if (this.state.trackedWallets[key]) return false;
-    this.state.trackedWallets[key] = { chatId, address, chain, initialized: false, createdAt: nowIso() };
+    const existing = this.state.trackedWallets[key];
+    if (existing) {
+      const changed = existing.name !== name || existing.emoji !== emoji;
+      existing.name = name;
+      existing.emoji = emoji;
+      if (changed) {
+        const prefix = `${key}|`;
+        for (const [positionKey, value] of Object.entries(this.state.positions)) {
+          if (positionKey.startsWith(prefix)) {
+            value.position.walletName = name;
+            value.position.walletEmoji = emoji;
+          }
+        }
+        this.persist();
+      }
+      return false;
+    }
+    this.state.trackedWallets[key] = { chatId, address, chain, name, emoji, initialized: false, createdAt: nowIso() };
     this.persist();
     return true;
   }
 
   wallets() {
-    return Object.values(this.state.trackedWallets).map(({ chatId, address, chain }) => ({ chatId, address, chain }));
+    return Object.values(this.state.trackedWallets).map(({ chatId, address, chain, name = "Wallet", emoji = "👝" }) => ({ chatId, address, chain, name, emoji }));
   }
 
   isInitialized(wallet) {
@@ -299,7 +422,7 @@ export class SnapshotStore {
 
   savePosition(wallet, position) {
     this.state.positions[this.positionKey(wallet, position.positionId)] = {
-      position,
+      position: { ...position, walletName: wallet.name || position.walletName || "Wallet", walletEmoji: wallet.emoji || position.walletEmoji || "👝" },
       active: true,
       lastSeenAt: nowIso(),
       closedAt: null,
@@ -361,6 +484,11 @@ export class LPAgentClient {
     return (Array.isArray(payload.data) ? payload.data : []).map((item) => positionFromApi(item, address, chain));
   }
 
+  async walletOverview(address, chain) {
+    const payload = await this.getJson("lp-positions/overview", { owner: address, chain });
+    return payload.data || payload;
+  }
+
   async positionDetail(positionId, wallet, chain) {
     const payload = await this.getJson("lp-positions/position", { position: positionId, chain });
     if (!payload.data || typeof payload.data !== "object") throw new ApiError("Detail posisi LP Agent tidak valid.");
@@ -386,11 +514,14 @@ export class LPAgentClient {
       const openingLog = earliestAddLiquidity(await this.positionLogs(enriched.positionId, enriched.wallet, enriched.chain));
       const openingAt = parseTimestamp(openingLog?.timestamp);
       const openingRange = openingRangeDisplay(enriched.raw, openingLog);
+      const openingParts = openingRangeParts(enriched.raw, openingLog);
       if (openingLog || openingRange) {
         enriched = {
           ...enriched,
           openedAt: openingAt ? openingAt.toISOString() : enriched.openedAt,
           openingRangeDisplay: openingRange,
+          openingRangePlus: openingParts?.plus || null,
+          openingRangeMinus: openingParts?.minus || null,
           rangeSource: openingRange ? "add_liquidity" : "current",
         };
       }
@@ -410,10 +541,10 @@ export class LPTracker {
     this.syncing = false;
   }
 
-  async register(chatId, address, chain = undefined) {
+  async register(chatId, address, name = "Wallet", emoji = "👝", chain = undefined) {
     const [normalizedAddress, normalizedChain] = normalizeAddress(address, chain);
-    const wallet = { chatId: Number(chatId), address: normalizedAddress, chain: normalizedChain };
-    const added = this.store.addWallet(wallet.chatId, wallet.address, wallet.chain);
+    const wallet = { chatId: Number(chatId), address: normalizedAddress, chain: normalizedChain, name: String(name || "Wallet"), emoji: String(emoji || "👝") };
+    const added = this.store.addWallet(wallet.chatId, wallet.address, wallet.chain, wallet.name, wallet.emoji);
     if (added) {
       try {
         await this.syncWallet(wallet, null, false);
@@ -463,6 +594,19 @@ export class LPTracker {
     }
 
     const events = [];
+    let walletWinRate;
+    let overviewLoaded = false;
+    const loadWalletWinRate = async () => {
+      if (overviewLoaded) return walletWinRate;
+      overviewLoaded = true;
+      if (typeof this.client.walletOverview !== "function") return null;
+      try {
+        walletWinRate = extractWinRate(await this.client.walletOverview(wallet.address, wallet.chain));
+      } catch (error) {
+        if (error.status !== 404 && error.status !== 429) this.logger(`Win rate tidak tersedia ${wallet.address} ${wallet.chain}: ${error.message}`);
+      }
+      return walletWinRate;
+    };
     for (const [positionId, saved] of Object.entries(existing)) {
       if (saved.active && !currentById.has(positionId)) {
         this.store.markClosed(wallet, positionId);
@@ -473,8 +617,10 @@ export class LPTracker {
       const previous = existing[positionId];
       if (!previous || !previous.active) {
         const enriched = await this.client.enrichPosition(position);
-        this.store.savePosition(wallet, enriched);
-        events.push({ chatId: wallet.chatId, eventType: "OPENED", position: enriched });
+        const winRate = (await loadWalletWinRate()) ?? enriched.walletWinRate;
+        const eventPosition = { ...enriched, walletName: wallet.name, walletEmoji: wallet.emoji, walletWinRate: winRate };
+        this.store.savePosition(wallet, eventPosition);
+        events.push({ chatId: wallet.chatId, eventType: "OPENED", position: eventPosition });
       }
     }
     return emitEvents ? events : [];
@@ -486,29 +632,79 @@ function escapeHtml(value) {
 }
 
 function eventTitle(eventType) {
-  return eventType === "OPENED" ? "🟢 LP POSITION OPENED" : "🔴 LP POSITION CLOSED";
+  return eventType === "OPENED" ? "🍏" : "🍎";
 }
 
 export function eventRange(position) {
   return position.openingRangeDisplay || position.currentRangeDisplay || "-";
 }
 
+function parseRangeParts(display) {
+  const values = String(display || "").match(/[+-]?\d+(?:\.\d+)?%/g)?.map((value) => Number.parseFloat(value)) || [];
+  const positive = values.filter((value) => value >= 0).sort((a, b) => b - a)[0];
+  const negative = values.filter((value) => value < 0).sort((a, b) => a - b)[0];
+  return { plus: positive === undefined ? "-" : formatSignedPercent(positive), minus: negative === undefined ? "-" : formatSignedPercent(negative) };
+}
+
+function eventRangeParts(position) {
+  if (position.openingRangeDisplay) {
+    const fallback = parseRangeParts(position.openingRangeDisplay);
+    return { plus: position.openingRangePlus || fallback.plus, minus: position.openingRangeMinus || fallback.minus };
+  }
+  const fallback = parseRangeParts(position.currentRangeDisplay);
+  return { plus: position.currentRangePlus || fallback.plus, minus: position.currentRangeMinus || fallback.minus };
+}
+
+function shortWallet(address) {
+  const value = String(address || "-");
+  return value.length > 12 ? `${value.slice(0, 6)}...${value.slice(-4)}` : value;
+}
+
+function eventToken(position) {
+  if (position.targetToken) return position.targetToken;
+  const symbols = String(position.pool || "").split("/").map((value) => value.trim());
+  const selected = symbols.find((value) => value.toLowerCase() === "musebook") || symbols[0] || "Token";
+  return { ticker: selected, name: selected };
+}
+
+function eventWalletName(position) {
+  return position.walletName || "Wallet";
+}
+
+function eventWalletEmoji(position) {
+  return position.walletEmoji || "👝";
+}
+
+function eventWinRate(position) {
+  return position.walletWinRate === null || position.walletWinRate === undefined ? "-" : formatPercent(position.walletWinRate);
+}
+
+function eventBaseFee(position) {
+  return position.baseFee || baseFeeDisplay(position.raw || {});
+}
+
 export function renderEventText(event, now = new Date()) {
   const { position } = event;
   const chain = position.chain === "ROBINHOOD" ? "Robinhood" : "SOL";
+  const token = eventToken(position);
+  const range = eventRangeParts(position);
   const lines = [
-    eventTitle(event.eventType),
+    `${eventTitle(event.eventType)} ${token.ticker} ${token.name}`,
     "",
-    `Wallet: ${position.wallet}`,
-    `Chain: ${chain}`,
-    `Pool: ${position.pool}`,
-    `Protocol: ${position.protocol}`,
-    `Range: ${eventRange(position)}`,
+    "👝 Wallet",
+    `${eventWalletEmoji(position)} | ${shortWallet(position.wallet)} | ${eventWalletName(position)} | ${eventWinRate(position)}`,
     "",
-    "Invested",
-    ...position.investments.map((item) => `${item.symbol}: ${formatAmount(item.amount)} | ${formatUsd(item.usdValue)} | ${formatShare(item.share)}`),
+    "💧 Pool",
+    `🔗 Chain | ${chain}`,
+    `♻️ Protocol | ${position.protocol}`,
+    `💦 Pool | ${position.pool}`,
+    `💸 Base fee | ${eventBaseFee(position)}`,
     "",
-    `Age: ${formatAge(position.openedAt, now)}`,
+    "📌 Detail",
+    ...position.investments.map((item, index) => `${index === 0 ? "💶" : "💷"} ${item.symbol} | ${formatAmount(item.amount)} | ${formatUsd(item.usdValue)}`),
+    `🏷 Range | ${range.plus} | ${range.minus}`,
+    "",
+    `⏰ ${formatAge(position.openedAt, now)}`,
   ];
   return lines.join("\n");
 }
@@ -516,19 +712,23 @@ export function renderEventText(event, now = new Date()) {
 export function renderEventHtml(event, now = new Date()) {
   const { position } = event;
   const chain = position.chain === "ROBINHOOD" ? "Robinhood" : "SOL";
+  const token = eventToken(position);
+  const range = eventRangeParts(position);
   const rows = position.investments.length
-    ? position.investments.map((item) => `<tr><td>${escapeHtml(item.symbol)}</td><td>${escapeHtml(formatAmount(item.amount))}</td><td>${escapeHtml(formatUsd(item.usdValue))}</td><td>${escapeHtml(formatShare(item.share))}</td></tr>`).join("")
-    : "<tr><td colspan='4'>-</td></tr>";
+    ? position.investments.map((item, index) => `<tr><td>${index === 0 ? "💶" : "💷"} ${escapeHtml(item.symbol)}</td><td>${escapeHtml(formatAmount(item.amount))}</td><td>${escapeHtml(formatUsd(item.usdValue))}</td></tr>`).join("")
+    : "<tr><td colspan='3'>-</td></tr>";
   return [
-    `<h2>${escapeHtml(eventTitle(event.eventType))}</h2>`,
-    `<p><b>Wallet</b><br><code>${escapeHtml(position.wallet)}</code></p>`,
-    `<p><b>Chain</b><br>${escapeHtml(chain)}</p>`,
-    `<p><b>Pool</b><br>${escapeHtml(position.pool)}</p>`,
-    `<p><b>Protocol</b><br>${escapeHtml(position.protocol)}</p>`,
-    `<p><b>Range at open</b><br>${escapeHtml(eventRange(position))}</p>`,
-    "<h3>Invested</h3>",
-    `<table><tr><th>Token</th><th>Amount</th><th>Value</th><th>Share</th></tr>${rows}</table>`,
-    `<p><b>Age</b><br>${escapeHtml(formatAge(position.openedAt, now))}</p>`,
+    `<h2>${eventTitle(event.eventType)} <b>${escapeHtml(token.ticker)}</b> ${escapeHtml(token.name)}</h2>`,
+    "<hr>",
+    "<h3>👝 Wallet</h3>",
+    `<table><tr><th></th><th>Wallet</th><th>Name</th><th>Win rate</th></tr><tr><td>${escapeHtml(eventWalletEmoji(position))}</td><td><code>${escapeHtml(shortWallet(position.wallet))}</code></td><td>${escapeHtml(eventWalletName(position))}</td><td>${escapeHtml(eventWinRate(position))}</td></tr></table>`,
+    "<hr>",
+    "<h3>💧 Pool</h3>",
+    `<table><tr><th>Name</th><th>Value</th></tr><tr><td>🔗 Chain</td><td>${escapeHtml(chain)}</td></tr><tr><td>♻️ Protocol</td><td>${escapeHtml(position.protocol)}</td></tr><tr><td>💦 Pool</td><td>${escapeHtml(position.pool)}</td></tr><tr><td>💸 Base fee</td><td>${escapeHtml(eventBaseFee(position))}</td></tr></table>`,
+    "<hr>",
+    "<h3>📌 Detail</h3>",
+    `<table><tr><th>Name</th><th>Value</th><th>USD</th></tr>${rows}<tr><td>🏷 Range</td><td>${escapeHtml(range.plus)}</td><td>${escapeHtml(range.minus)}</td></tr></table>`,
+    `<p>⏰ ${escapeHtml(formatAge(position.openedAt, now))}</p>`,
   ].join("");
 }
 
@@ -626,20 +826,23 @@ export async function runBot() {
         const chatId = message.chat?.id;
         if (chatId === undefined || !isAllowedUser(message.from?.id, allowedUserIds)) continue;
         if (text.startsWith("/start")) {
-          await telegram.sendText(chatId, "Kirim /track <wallet> untuk mulai memantau posisi LP.");
+          await telegram.sendText(chatId, "Kirim /track <address> <name> <emoji> untuk mulai memantau posisi LP.");
           continue;
         }
         if (!text.startsWith("/track")) continue;
         const args = text.split(/\s+/);
-        if (![2, 3].includes(args.length)) {
-          await telegram.sendText(chatId, "Format: /track <wallet> [SOL|ROBINHOOD]");
+        if (![3, 4].includes(args.length)) {
+          await telegram.sendText(chatId, "Format: /track <address> <name> <emoji>");
           continue;
         }
         try {
-          const result = await tracker.register(chatId, args[1], args[2]);
+          const legacyChain = args.length === 3 && ["SOL", "ROBINHOOD"].includes(args[2].toUpperCase()) ? args[2] : undefined;
+          const name = legacyChain ? "Wallet" : args[2];
+          const emoji = legacyChain ? "👝" : args[3];
+          const result = await tracker.register(chatId, args[1], name, emoji, legacyChain);
           if (result.warning) await telegram.sendText(chatId, `Tracking tersimpan, tetapi baseline belum bisa diambil: ${result.warning}`);
-          else if (result.added) await telegram.sendText(chatId, `Tracking aktif untuk ${result.wallet.address} (${result.wallet.chain}). Posisi saat ini dijadikan baseline.`);
-          else await telegram.sendText(chatId, "Wallet tersebut sudah sedang di-track.");
+          else if (result.added) await telegram.sendText(chatId, `Tracking aktif untuk ${result.wallet.name} ${result.wallet.emoji} (${result.wallet.address}, ${result.wallet.chain}). Posisi saat ini dijadikan baseline.`);
+          else await telegram.sendText(chatId, "Wallet tersebut sudah di-track; nama dan emoji diperbarui.");
         } catch (error) {
           await telegram.sendText(chatId, `Tidak bisa track wallet: ${error.message}`);
         }

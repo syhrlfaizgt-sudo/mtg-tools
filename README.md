@@ -35,9 +35,9 @@ node main.js
 Command bot:
 
 ```text
-/track <wallet>
-/track <wallet> SOL
-/track <wallet> ROBINHOOD
+/track <address> <name> <emoji>
+
+Chain dideteksi otomatis dari alamat EVM (`ROBINHOOD`) atau Solana (`SOL`). Nama dan emoji disimpan bersama wallet dan dipakai pada alert.
 ```
 
 Chain dideteksi otomatis dari format address jika argumen chain tidak diberikan. Posisi yang sudah ada ketika wallet pertama kali ditambahkan menjadi baseline dan tidak mengirim alert. Polling berikutnya hanya mengirim event `OPENED` atau `CLOSED`.
@@ -58,7 +58,7 @@ sebagai daftar konfigurasi yang diperlukan.
 
 ## Data dan alert
 
-Snapshot disimpan sebagai JSON atomik pada `DATABASE_PATH` (default `data/tracker.json`). Snapshot mempertahankan pool, protocol, range saat open, umur posisi, serta nominal token dan nilai USD untuk alert penutupan.
+Snapshot disimpan sebagai JSON atomik pada `DATABASE_PATH` (default `data/tracker.json`). Snapshot mempertahankan pool, protocol, base fee, range saat open, umur posisi, alias wallet, serta nominal token dan nilai USD untuk alert penutupan.
 
 Pengiriman utama memakai method Telegram `sendRichMessage` dengan rich HTML table. Jika method tersebut ditolak oleh endpoint Bot API, bot memakai pesan teks biasa sebagai fallback agar alert tidak hilang.
 
