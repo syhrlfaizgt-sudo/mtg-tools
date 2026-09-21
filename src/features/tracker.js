@@ -11,7 +11,14 @@ const PROTOCOL_NAMES = {
 };
 
 export class TrackerError extends Error {}
-export class ApiError extends TrackerError {}
+export class ApiError extends TrackerError {
+  constructor(message, { status = null, retryAfterMs = 0 } = {}) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.retryAfterMs = retryAfterMs;
+  }
+}
 
 export function detectChain(address) {
   if (EVM_ADDRESS.test(address)) return "ROBINHOOD";
@@ -35,6 +42,21 @@ export function normalizeAddress(address, chain = undefined) {
     }
   }
   return [detected === "ROBINHOOD" ? value.toLowerCase() : value, detected];
+}
+
+export function parseAllowedUserIds(value) {
+  const ids = String(value ?? "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  if (!ids.length || ids.some((id) => !/^\d+$/.test(id))) {
+    throw new TrackerError("ALLOWED_USER_ID wajib berisi Telegram user ID numerik.");
+  }
+  return new Set(ids);
+}
+
+export function isAllowedUser(userId, allowedUserIds) {
+  return userId !== undefined && userId !== null && allowedUserIds.has(String(userId));
 }
 
 function number(value) {
@@ -300,9 +322,12 @@ export class LPAgentClient {
     this.apiKey = apiKey;
     this.baseUrl = baseUrl.replace(/\/$/, "");
     this.timeoutMs = timeoutMs;
+    this.rateLimitUntil = 0;
   }
 
   async getJson(endpoint, params) {
+    const waitMs = Math.max(0, this.rateLimitUntil - Date.now());
+    if (waitMs > 0) await sleep(waitMs);
     const url = new URL(`${this.baseUrl}/${endpoint}`);
     for (const [key, value] of Object.entries(params || {})) url.searchParams.set(key, value);
     const controller = new AbortController();
@@ -310,7 +335,18 @@ export class LPAgentClient {
     try {
       const response = await fetch(url, { headers: { "x-api-key": this.apiKey, Accept: "application/json" }, signal: controller.signal });
       const payload = await response.json();
-      if (!response.ok || payload?.status !== "success") throw new ApiError(payload?.message || `LP Agent HTTP ${response.status}`);
+      if (response.status === 429) {
+        const retryAfterHeader = response.headers.get("retry-after");
+        const retryAfterSeconds = retryAfterHeader === null ? Number.NaN : Number(retryAfterHeader);
+        const retryAfterMs = Number.isFinite(retryAfterSeconds)
+          ? Math.max(1_000, retryAfterSeconds * 1_000)
+          : 60_000;
+        this.rateLimitUntil = Date.now() + retryAfterMs;
+        throw new ApiError(`LP Agent HTTP 429; retry dalam ${Math.ceil(retryAfterMs / 1_000)} detik`, { status: 429, retryAfterMs });
+      }
+      if (!response.ok || payload?.status !== "success") {
+        throw new ApiError(payload?.message || `LP Agent HTTP ${response.status}`, { status: response.status });
+      }
       return payload;
     } catch (error) {
       if (error instanceof ApiError) throw error;
@@ -341,8 +377,9 @@ export class LPAgentClient {
     if (needsInvestmentDetail(enriched)) {
       try {
         enriched = await this.positionDetail(position.positionId, position.wallet, position.chain);
-      } catch {
+      } catch (error) {
         // Opening data is still useful when detail access is unavailable.
+        if (error.status === 429) return enriched;
       }
     }
     try {
@@ -357,8 +394,9 @@ export class LPAgentClient {
           rangeSource: openingRange ? "add_liquidity" : "current",
         };
       }
-    } catch {
+    } catch (error) {
       // The historical range is optional; do not block open/close detection.
+      if (error.status === 429) return enriched;
     }
     return enriched;
   }
@@ -402,7 +440,8 @@ export class LPTracker {
         try {
           current = await this.client.openingPositions(group.address, group.chain);
         } catch (error) {
-          this.logger(`Sync gagal ${group.address} ${group.chain}: ${error.message}`);
+          const prefix = error.status === 429 ? "LP Agent rate limit" : "Sync gagal";
+          this.logger(`${prefix} ${group.address} ${group.chain}: ${error.message}`);
           continue;
         }
         for (const wallet of group.wallets) events.push(...await this.syncWallet(wallet, current, true));
@@ -555,6 +594,7 @@ export async function runBot() {
   const botToken = process.env.TELEGRAM_BOT_TOKEN?.trim();
   const apiKey = process.env.LPAGENT_API_KEY?.trim();
   if (!botToken || !apiKey) throw new Error("Set TELEGRAM_BOT_TOKEN dan LPAGENT_API_KEY terlebih dahulu.");
+  const allowedUserIds = parseAllowedUserIds(process.env.ALLOWED_USER_ID);
   const databasePath = process.env.DATABASE_PATH || "data/tracker.json";
   const interval = Math.max(10, Number(process.env.POLL_INTERVAL_SECONDS || 60) * 1000);
   const store = new SnapshotStore(databasePath);
@@ -584,7 +624,7 @@ export async function runBot() {
         const message = update.message || {};
         const text = String(message.text || "").trim();
         const chatId = message.chat?.id;
-        if (chatId === undefined) continue;
+        if (chatId === undefined || !isAllowedUser(message.from?.id, allowedUserIds)) continue;
         if (text.startsWith("/start")) {
           await telegram.sendText(chatId, "Kirim /track <wallet> untuk mulai memantau posisi LP.");
           continue;
@@ -605,8 +645,10 @@ export async function runBot() {
         }
       }
     } catch (error) {
-      console.error(`Telegram polling gagal: ${error.message}`);
-      await sleep(5_000);
+      if (!stopping && error.name !== "AbortError") {
+        console.error(`Telegram polling gagal: ${error.message}`);
+      }
+      if (!stopping) await sleep(5_000);
     }
   }
 }

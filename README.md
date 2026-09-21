@@ -25,7 +25,8 @@ docs/
 1. Salin `.env.example` menjadi `.env` atau export variabelnya ke environment.
 2. Isi `TELEGRAM_BOT_TOKEN` dari BotFather.
 3. Isi `LPAGENT_API_KEY` dari LP Agent.
-4. Jalankan:
+4. Isi `ALLOWED_USER_ID` dengan Telegram user ID yang boleh memakai bot.
+5. Jalankan:
 
 ```bash
 node main.js
@@ -41,7 +42,9 @@ Command bot:
 
 Chain dideteksi otomatis dari format address jika argumen chain tidak diberikan. Posisi yang sudah ada ketika wallet pertama kali ditambahkan menjadi baseline dan tidak mengirim alert. Polling berikutnya hanya mengirim event `OPENED` atau `CLOSED`.
 
-Default polling adalah 60 detik dan dapat diubah melalui `POLL_INTERVAL_SECONDS`.
+Bot hanya memproses pesan dari user yang ID-nya ada di `ALLOWED_USER_ID`. Beberapa ID dapat ditulis dengan koma, misalnya `123456789,987654321`. Jika variable ini kosong atau tidak valid, bot tidak akan start.
+
+Default polling adalah 60 detik dan dapat diubah melalui `POLL_INTERVAL_SECONDS`. Jika LP Agent mengembalikan HTTP 429, bot membaca `Retry-After` dan menunda request berikutnya tanpa mengubah snapshot atau mengirim false `CLOSED` alert.
 
 ## Pengembangan
 

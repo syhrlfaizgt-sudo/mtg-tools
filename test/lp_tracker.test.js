@@ -6,10 +6,13 @@ import test from "node:test";
 
 import {
   LPTracker,
+  LPAgentClient,
   SnapshotStore,
   formatAge,
+  isAllowedUser,
   normalizeAddress,
   openingRangeDisplay,
+  parseAllowedUserIds,
   positionFromApi,
   renderEventHtml,
   renderEventText,
@@ -53,6 +56,14 @@ test("detects EVM and Solana addresses", () => {
   assert.deepEqual(normalizeAddress(WALLET), [WALLET, "ROBINHOOD"]);
   assert.deepEqual(normalizeAddress("1".repeat(32)), ["1".repeat(32), "SOL"]);
   assert.throws(() => normalizeAddress("not-a-wallet"));
+});
+
+test("restricts access to configured Telegram user IDs", () => {
+  const allowed = parseAllowedUserIds("123456789, 987654321");
+  assert.equal(isAllowedUser(123456789, allowed), true);
+  assert.equal(isAllowedUser(111111111, allowed), false);
+  assert.throws(() => parseAllowedUserIds(""));
+  assert.throws(() => parseAllowedUserIds("not-a-number"));
 });
 
 test("first sync creates a baseline without alert", async () => {
@@ -112,4 +123,21 @@ test("uses opening timestamp for age", () => {
 
 test("calculates range relative to the opening pool price", () => {
   assert.equal(openingRangeDisplay({ priceRange: [30, 60, 40] }, { price0: 50 }), "-40% to 20%");
+});
+
+test("handles LP Agent rate limits with Retry-After", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({ status: "error" }), {
+    status: 429,
+    headers: { "content-type": "application/json", "retry-after": "2" },
+  });
+  try {
+    const client = new LPAgentClient("test-key");
+    await assert.rejects(
+      () => client.getJson("lp-positions/opening", {}),
+      (error) => error.status === 429 && error.retryAfterMs === 2_000,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
