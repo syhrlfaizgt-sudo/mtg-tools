@@ -14,7 +14,6 @@ dan tidak bercampur dengan konfigurasi atau dokumentasi.
 ├── docs/                       # dokumentasi teknis dan keputusan struktur
 ├── data/                       # data runtime lokal (di-ignore Git)
 ├── main.js                     # launcher tipis untuk npm start
-├── lp_tracker.js               # compatibility export untuk import lama
 ├── .env.example                # daftar environment variable tanpa secret
 └── package.json
 ```
@@ -25,8 +24,7 @@ dan tidak bercampur dengan konfigurasi atau dokumentasi.
 `src/features/`. Test mengimpor modul fitur secara langsung agar logika bisnis
 bisa diuji tanpa harus menyalakan Telegram atau API eksternal.
 
-`lp_tracker.js` hanya dipertahankan sebagai compatibility layer. Import baru
-sebaiknya langsung menuju `src/features/tracker.js`.
+Import fitur dilakukan langsung melalui `src/features/tracker.js`.
 
 ## Aturan data dan secret
 
