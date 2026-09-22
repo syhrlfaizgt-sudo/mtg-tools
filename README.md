@@ -46,6 +46,8 @@ Chain dideteksi otomatis dari format address jika argumen chain tidak diberikan.
 
 Bot hanya memproses pesan dari user yang ID-nya ada di `ALLOWED_USER_ID`. Beberapa ID dapat ditulis dengan koma, misalnya `123456789,987654321`. Jika variable ini kosong atau tidak valid, bot tidak akan start.
 
+Saat `/track` diproses, bot langsung mengirim status sementara sebelum mengambil baseline dari LP Agent. Permintaan `/track` kedua dari user yang sama ditahan sampai proses pertama selesai agar request tidak menumpuk.
+
 Default polling adalah 60 detik dan dapat diubah melalui `POLL_INTERVAL_SECONDS`. Jika LP Agent mengembalikan HTTP 429, bot membaca `Retry-After` dan menunda request berikutnya tanpa mengubah snapshot atau mengirim false `CLOSED` alert.
 
 ## Pengembangan

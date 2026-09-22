@@ -1222,6 +1222,8 @@ export async function runBot() {
   const store = new SnapshotStore(databasePath);
   const telegram = new TelegramClient(botToken);
   const tracker = new LPTracker(new LPAgentClient(apiKey), store, (message) => console.error(message));
+  const pendingTrackChats = new Set();
+  const trackGenerations = new Map();
   let stopping = false;
   const stop = () => { stopping = true; };
   process.once("SIGINT", stop);
@@ -1238,51 +1240,78 @@ export async function runBot() {
     }
   })();
 
+  const handleUpdate = async (update) => {
+    const message = update.message || {};
+    const text = String(message.text || "").trim();
+    const chatId = message.chat?.id;
+    if (chatId === undefined || !isAllowedUser(message.from?.id, allowedUserIds)) return;
+    const args = text.split(/\s+/);
+    const command = String(args[0] || "").toLowerCase().split("@")[0];
+    if (command === "/start") {
+      await telegram.sendText(chatId, "Kirim /track <address> <name> <emoji> untuk mulai memantau posisi LP.");
+      return;
+    }
+    if (command === "/track-list") {
+      await telegram.sendRichTrackList(chatId, tracker.list(chatId));
+      return;
+    }
+    if (command === "/track-remove") {
+      if (args.length !== 2) {
+        await telegram.sendText(chatId, "Format: /track-remove <id|address|name|all>");
+        return;
+      }
+      const chatKey = String(chatId);
+      trackGenerations.set(chatKey, (trackGenerations.get(chatKey) || 0) + 1);
+      const removed = tracker.remove(chatId, args[1]);
+      if (removed.length) await telegram.sendRichTrackRemoved(chatId, removed);
+      else await telegram.sendText(chatId, "Tracking tidak ditemukan.");
+      return;
+    }
+    if (command !== "/track") return;
+    if (![3, 4].includes(args.length)) {
+      await telegram.sendText(chatId, "Format: /track <address> <name> <emoji>");
+      return;
+    }
+    const chatKey = String(chatId);
+    if (pendingTrackChats.has(chatKey)) {
+      await telegram.sendText(chatId, "⏳ Permintaan /track sebelumnya masih diproses. Tunggu sampai selesai.");
+      return;
+    }
+    pendingTrackChats.add(chatKey);
+    const generation = trackGenerations.get(chatKey) || 0;
+    try {
+      await telegram.sendText(chatId, "⏳ Wallet sedang diproses dan baseline posisi sedang diambil...");
+      const legacyChain = args.length === 3 && ["SOL", "ROBINHOOD"].includes(args[2].toUpperCase()) ? args[2] : undefined;
+      const name = legacyChain ? "Wallet" : args[2];
+      const emoji = legacyChain ? "👝" : args[3];
+      const result = await tracker.register(chatId, args[1], name, emoji, legacyChain);
+      if ((trackGenerations.get(chatKey) || 0) !== generation) {
+        // A remove command arrived while LP Agent was still loading the baseline.
+        // Do not let the late register resurrect a wallet the user removed.
+        tracker.remove(chatId, result.wallet.address);
+        return;
+      }
+      if (result.warning) await telegram.sendText(chatId, `Tracking tersimpan, tetapi baseline belum bisa diambil: ${result.warning}`);
+      else if (result.added) await telegram.sendText(chatId, `Tracking aktif untuk ${result.wallet.name} ${result.wallet.emoji} (${result.wallet.address}, ${result.wallet.chain}). Posisi saat ini dijadikan baseline.`);
+      else await telegram.sendText(chatId, "Wallet tersebut sudah di-track; nama dan emoji diperbarui.");
+    } catch (error) {
+      await telegram.sendText(chatId, `Tidak bisa track wallet: ${error.message}`);
+    } finally {
+      pendingTrackChats.delete(chatKey);
+    }
+  };
+
   let offset = null;
   while (!stopping) {
     try {
       for (const update of await telegram.getUpdates(offset)) {
         offset = Number(update.update_id) + 1;
-        const message = update.message || {};
-        const text = String(message.text || "").trim();
-        const chatId = message.chat?.id;
-        if (chatId === undefined || !isAllowedUser(message.from?.id, allowedUserIds)) continue;
-        const args = text.split(/\s+/);
-        const command = String(args[0] || "").toLowerCase().split("@")[0];
-        if (command === "/start") {
-          await telegram.sendText(chatId, "Kirim /track <address> <name> <emoji> untuk mulai memantau posisi LP.");
-          continue;
-        }
-        if (command === "/track-list") {
-          await telegram.sendRichTrackList(chatId, tracker.list(chatId));
-          continue;
-        }
-        if (command === "/track-remove") {
-          if (args.length !== 2) {
-            await telegram.sendText(chatId, "Format: /track-remove <id|address|name|all>");
-            continue;
-          }
-          const removed = tracker.remove(chatId, args[1]);
-          if (removed.length) await telegram.sendRichTrackRemoved(chatId, removed);
-          else await telegram.sendText(chatId, "Tracking tidak ditemukan.");
-          continue;
-        }
-        if (command !== "/track") continue;
-        if (![3, 4].includes(args.length)) {
-          await telegram.sendText(chatId, "Format: /track <address> <name> <emoji>");
-          continue;
-        }
-        try {
-          const legacyChain = args.length === 3 && ["SOL", "ROBINHOOD"].includes(args[2].toUpperCase()) ? args[2] : undefined;
-          const name = legacyChain ? "Wallet" : args[2];
-          const emoji = legacyChain ? "👝" : args[3];
-          const result = await tracker.register(chatId, args[1], name, emoji, legacyChain);
-          if (result.warning) await telegram.sendText(chatId, `Tracking tersimpan, tetapi baseline belum bisa diambil: ${result.warning}`);
-          else if (result.added) await telegram.sendText(chatId, `Tracking aktif untuk ${result.wallet.name} ${result.wallet.emoji} (${result.wallet.address}, ${result.wallet.chain}). Posisi saat ini dijadikan baseline.`);
-          else await telegram.sendText(chatId, "Wallet tersebut sudah di-track; nama dan emoji diperbarui.");
-        } catch (error) {
-          await telegram.sendText(chatId, `Tidak bisa track wallet: ${error.message}`);
-        }
+        // Never let a slow LP Agent request block Telegram polling. In particular,
+        // a 429 during /track must not prevent a later /track-remove or /track
+        // update from being received. Each task owns its error handling here.
+        void handleUpdate(update).catch((error) => {
+          if (!stopping) console.error(`Pemrosesan command gagal: ${error.message}`);
+        });
       }
     } catch (error) {
       if (!stopping && error.name !== "AbortError") {

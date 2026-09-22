@@ -199,6 +199,15 @@ test("lists and removes tracked wallets by stable ID, name, address, or all", as
   assert.equal(tracker.list(10).length, 0);
 });
 
+test("can track a wallet again after removing all wallets", async () => {
+  const { tracker } = makeTracker([]);
+  await tracker.register(10, WALLET, "Alpha", "🦊");
+  assert.equal(tracker.remove(10, "all").length, 1);
+  const result = await tracker.register(10, `0x${"c".repeat(40)}`, "Rabbit", "🐰");
+  assert.equal(result.added, true);
+  assert.deepEqual(tracker.list(10).map((wallet) => wallet.name), ["Rabbit"]);
+});
+
 test("keeps wallet emoji and win rate on close alerts", async () => {
   const { tracker, client } = makeTracker([apiPosition("p1")], { win_rate: { ALL: 0.625 } });
   await tracker.register(10, WALLET, "Alpha", "🦊");
