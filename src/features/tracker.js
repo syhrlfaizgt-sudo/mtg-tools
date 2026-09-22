@@ -205,15 +205,34 @@ function openingAmount(raw, openingLog, index) {
   return number(raw?.[`inputToken${index}`]);
 }
 
+const TICK_BASE = 1.0001;
+const UNISWAP_PROTOCOLS = new Set(["uniswap_v3", "uniswap_v4"]);
+
+function tickPercent(openingTick, tick, uniswap) {
+  // A Uniswap price grows with the tick, a Meteora bin price shrinks with the
+  // bin id, so the same opening tick flips sign between the two families.
+  // ponytail: Meteora keeps the pre-fix sign on purpose so SOL alerts do not
+  // move; dropping the branch fixes SOL the same way once that is wanted.
+  return (Math.pow(TICK_BASE, uniswap ? tick - openingTick : openingTick - tick) - 1) * 100;
+}
+
 function openingRangeFromTicks(raw, openingLog) {
   const bounds = openingTickBounds(raw, openingLog);
   if (!bounds) return null;
+  const uniswap = UNISWAP_PROTOCOLS.has(String(raw?.protocol || "").toLowerCase());
   const amount0 = openingAmount(raw, openingLog, 0);
   const amount1 = openingAmount(raw, openingLog, 1);
   const hasOnlyOneSide = (amount0 !== null && amount1 !== null)
     && ((Math.abs(amount0) > 0 && Math.abs(amount1) === 0) || (Math.abs(amount0) === 0 && Math.abs(amount1) > 0));
   if (hasOnlyOneSide) {
-    const width = (Math.pow(1.0001, bounds.lower - bounds.upper) - 1) * 100;
+    const width = (Math.pow(TICK_BASE, bounds.lower - bounds.upper) - 1) * 100;
+    // A single-sided Uniswap deposit sits at the bound it was opened against:
+    // all-token0 means the price opened at the lower bound, all-token1 at the
+    // upper one, so only one side of the range has room.
+    if (uniswap && Math.abs(amount1) === 0) {
+      const up = formatSignedPercent(-width);
+      return { display: `${up} to +0%`, plus: up, minus: "+0%" };
+    }
     return { display: `+0% to ${formatSignedPercent(width)}`, plus: "+0%", minus: formatSignedPercent(width) };
   }
   const price0 = number(openingLog?.price0);
@@ -221,9 +240,9 @@ function openingRangeFromTicks(raw, openingLog) {
   const decimals0 = number(openingLog?.decimal0) ?? number(raw?.decimal0) ?? 18;
   const decimals1 = number(openingLog?.decimal1) ?? number(raw?.decimal1) ?? 18;
   if (price0 === null || price1 === null || price0 <= 0 || price1 <= 0) return null;
-  const openingTick = Math.log((price0 / price1) * 10 ** (decimals1 - decimals0)) / Math.log(1.0001);
-  const lowerPct = (Math.pow(1.0001, openingTick - bounds.lower) - 1) * 100;
-  const upperPct = (Math.pow(1.0001, openingTick - bounds.upper) - 1) * 100;
+  const openingTick = Math.log((price0 / price1) * 10 ** (decimals1 - decimals0)) / Math.log(TICK_BASE);
+  const lowerPct = tickPercent(openingTick, bounds.lower, uniswap);
+  const upperPct = tickPercent(openingTick, bounds.upper, uniswap);
   const values = [lowerPct, upperPct];
   const positive = values.filter((item) => item >= 0).sort((a, b) => b - a)[0];
   const negative = values.filter((item) => item < 0).sort((a, b) => a - b)[0];
@@ -314,8 +333,20 @@ function winRateFromValue(value) {
   return parsed === null ? null : parsed <= 1 ? parsed * 100 : parsed;
 }
 
-function extractWinRate(value) {
+function extractWinRate(value, protocol = undefined) {
   if (!value || typeof value !== "object") return null;
+  if (Array.isArray(value)) {
+    const protocolKey = String(protocol || "").toLowerCase();
+    const matching = protocolKey
+      ? value.find((item) => String(item?.protocol || "").toLowerCase() === protocolKey)
+      : null;
+    if (matching) return extractWinRate(matching);
+    for (const item of value) {
+      const nested = extractWinRate(item);
+      if (nested !== null) return nested;
+    }
+    return null;
+  }
   for (const key of ["winRate", "win_rate", "winrate", "winningRate", "winning_rate", "winRatePercentage", "win_rate_percentage"]) {
     if (value[key] !== undefined) {
       const direct = winRateFromValue(value[key]);
@@ -323,7 +354,7 @@ function extractWinRate(value) {
     }
   }
   for (const child of [value.data, value.overview, value.stats, value.walletStats, value.performance]) {
-    const nested = extractWinRate(child);
+    const nested = extractWinRate(child, protocol);
     if (nested !== null) return nested;
   }
   return null;
@@ -339,8 +370,18 @@ function feePercentFromRaw(raw) {
   if (rawFee !== null) return rawFee;
   const fee = firstNumber(poolInfo, ["fee", "feeRate", "fee_rate"]);
   if (fee === null) return null;
-  if (protocol === "uniswap_v3" || protocol === "uniswap_v4") return fee / 10_000;
+  if (UNISWAP_PROTOCOLS.has(protocol)) {
+    // Uniswap V4 packs a dynamic-fee flag into the high bit of the same field,
+    // so 0x800000 is not a 838.861% static fee.
+    if (protocol === "uniswap_v4" && (fee & 0x800000) !== 0) return null;
+    return fee / 10_000;
+  }
   return fee <= 1 ? fee * 100 : fee;
+}
+
+function isDynamicFee(raw) {
+  const fee = number(raw?.poolInfo?.fee);
+  return String(raw?.protocol || "").toLowerCase() === "uniswap_v4" && fee !== null && (fee & 0x800000) !== 0;
 }
 
 function formatFeePercent(value) {
@@ -349,7 +390,7 @@ function formatFeePercent(value) {
 }
 
 export function baseFeeDisplay(raw) {
-  return formatFeePercent(feePercentFromRaw(raw));
+  return isDynamicFee(raw) ? "Dinamis" : formatFeePercent(feePercentFromRaw(raw));
 }
 
 function positionPoolId(position) {
@@ -599,14 +640,42 @@ export class SnapshotStore {
 }
 
 export class LPAgentClient {
-  constructor(apiKey, { baseUrl = "https://api.lpagent.io/open-api/v1", timeoutMs = 30_000, poolCacheTtlMs = 5 * 60_000 } = {}) {
+  constructor(apiKey, { baseUrl = "https://api.lpagent.io/open-api/v1", timeoutMs = 30_000, poolCacheTtlMs = 5 * 60_000, positionCacheTtlMs = 30 * 60_000 } = {}) {
     this.apiKey = apiKey;
     this.baseUrl = baseUrl.replace(/\/$/, "");
     this.timeoutMs = timeoutMs;
     this.poolCacheTtlMs = poolCacheTtlMs;
+    this.positionCacheTtlMs = positionCacheTtlMs;
     this.poolCache = new Map();
+    this.positionCache = new Map();
     this.poolRequests = new Map();
     this.rateLimitUntil = 0;
+  }
+
+  /**
+   * Cached GET keyed per wallet/chain. A position's opening logs and a wallet's
+   * overview do not change while the position is open, and the 5-requests-per
+   * -minute limit makes the repeat calls the difference between alerting and
+   * being rate limited.
+   */
+  async cachedJson(cache, key, ttlMs, load, { nullTtlMs = 0 } = {}) {
+    const cached = cache.get(key);
+    if (cached && cached.expiresAt > Date.now()) return cached.value;
+    if (this.poolRequests.has(key)) return this.poolRequests.get(key);
+    const request = (async () => {
+      const value = await load();
+      // ponytail: immutable per open position, so it survives the process; a
+      // miss is retried on a short TTL in case the indexer is still catching up.
+      const ttl = value === null || value === undefined ? nullTtlMs : ttlMs;
+      if (ttl > 0) cache.set(key, { value, expiresAt: Date.now() + ttl });
+      return value;
+    })();
+    this.poolRequests.set(key, request);
+    try {
+      return await request;
+    } finally {
+      this.poolRequests.delete(key);
+    }
   }
 
   async getJson(endpoint, params) {
@@ -646,19 +715,18 @@ export class LPAgentClient {
   }
 
   async walletOverview(address, chain) {
-    const payload = await this.getJson("lp-positions/overview", { owner: address, chain });
-    return payload.data || payload;
+    return this.cachedJson(this.positionCache, `overview|${chain}|${address}`, this.poolCacheTtlMs, async () => {
+      const payload = await this.getJson("lp-positions/overview", { owner: address, chain });
+      return payload.data || payload;
+    });
   }
 
   async poolMetrics(position) {
     const poolId = positionPoolId(position);
     if (!poolId) return null;
     const protocol = protocolKeyFromPosition(position);
-    const key = `${position.chain}|${protocol || "all"}|${poolId.toLowerCase()}`;
-    const cached = this.poolCache.get(key);
-    if (cached && cached.expiresAt > Date.now()) return cached.value;
-    if (this.poolRequests.has(key)) return this.poolRequests.get(key);
-    const request = (async () => {
+    const key = `pool|${position.chain}|${protocol || "all"}|${poolId.toLowerCase()}`;
+    return this.cachedJson(this.poolCache, key, this.poolCacheTtlMs, async () => {
       const payload = await this.getJson("pools/discover", {
         chain: position.chain,
         search: poolId,
@@ -669,16 +737,8 @@ export class LPAgentClient {
       });
       const pools = Array.isArray(payload.data) ? payload.data : [];
       const pool = pools.find((item) => String(item?.pool || "").toLowerCase() === poolId.toLowerCase()) || pools[0];
-      const value = poolMetricsFromApi(pool);
-      if (value) this.poolCache.set(key, { value, expiresAt: Date.now() + this.poolCacheTtlMs });
-      return value;
-    })();
-    this.poolRequests.set(key, request);
-    try {
-      return await request;
-    } finally {
-      this.poolRequests.delete(key);
-    }
+      return poolMetricsFromApi(pool);
+    }, { nullTtlMs: 60_000 });
   }
 
   async positionDetail(positionId, wallet, chain) {
@@ -688,8 +748,14 @@ export class LPAgentClient {
   }
 
   async positionLogs(positionId, wallet, chain) {
-    const payload = await this.getJson("lp-positions/logs", { position: positionId, owner: wallet, chain });
-    return Array.isArray(payload.data) ? payload.data : [];
+    const logs = await this.cachedJson(this.positionCache, `logs|${chain}|${positionId}`, this.positionCacheTtlMs, async () => {
+      const payload = await this.getJson("lp-positions/logs", { position: positionId, owner: wallet, chain });
+      const rows = Array.isArray(payload.data) ? payload.data : [];
+      // Empty means the indexer has not caught up yet, so retry soon instead of
+      // pinning the position to a missing opening range.
+      return rows.length ? rows : null;
+    }, { nullTtlMs: 60_000 });
+    return logs || [];
   }
 
   async enrichPosition(position) {
@@ -901,23 +967,24 @@ export class LPTracker {
     const currentById = new Map(positions.map((position) => [position.positionId, position]));
     const existing = this.store.positions(wallet);
     const observedAt = nowIso();
-    let walletWinRate;
+    let walletOverviewData;
     let overviewLoaded = false;
-    const loadWalletWinRate = async () => {
-      if (overviewLoaded) return walletWinRate;
+    const loadWalletWinRate = async (protocol = undefined) => {
+      if (overviewLoaded) return extractWinRate(walletOverviewData, protocol);
       overviewLoaded = true;
       if (typeof this.client.walletOverview !== "function") return null;
       try {
-        walletWinRate = extractWinRate(await this.client.walletOverview(wallet.address, wallet.chain));
+        walletOverviewData = await this.client.walletOverview(wallet.address, wallet.chain);
       } catch (error) {
         if (error.status !== 404 && error.status !== 429) this.logger(`Win rate tidak tersedia ${wallet.address} ${wallet.chain}: ${error.message}`);
+        walletOverviewData = null;
       }
-      return walletWinRate;
+      return extractWinRate(walletOverviewData, protocol);
     };
     if (!this.store.isInitialized(wallet)) {
-      const overviewWinRate = await loadWalletWinRate();
       for (const position of currentById.values()) {
         const enriched = await this.client.enrichPosition(position);
+        const overviewWinRate = await loadWalletWinRate(enriched.raw?.protocol);
         this.store.savePosition(wallet, {
           ...enriched,
           walletName: wallet.name,
@@ -933,7 +1000,7 @@ export class LPTracker {
     for (const [positionId, saved] of Object.entries(existing)) {
       if (saved.active && !currentById.has(positionId)) {
         this.store.markClosed(wallet, positionId);
-        const winRate = saved.position.walletWinRate ?? await loadWalletWinRate();
+        const winRate = saved.position.walletWinRate ?? await loadWalletWinRate(saved.position.raw?.protocol);
         const closedPosition = !saved.position.poolMetrics && typeof this.client.enrichPoolMetrics === "function"
           ? await this.client.enrichPoolMetrics(saved.position)
           : saved.position;
@@ -955,7 +1022,7 @@ export class LPTracker {
       if (!previous || !previous.active) {
         let enriched = await this.client.enrichPosition(position);
         if (typeof this.client.enrichPoolMetrics === "function") enriched = await this.client.enrichPoolMetrics(enriched);
-        const winRate = (await loadWalletWinRate()) ?? enriched.walletWinRate;
+        const winRate = (await loadWalletWinRate(enriched.raw?.protocol)) ?? enriched.walletWinRate;
         const eventPosition = { ...enriched, walletName: wallet.name, walletEmoji: wallet.emoji, walletWinRate: winRate };
         this.store.savePosition(wallet, eventPosition);
         events.push({ chatId: wallet.chatId, eventType: "OPENED", position: eventPosition, observedAt });

@@ -64,15 +64,22 @@ sebagai daftar konfigurasi yang diperlukan.
 
 Snapshot disimpan sebagai JSON atomik pada `DATABASE_PATH` (default `data/tracker.json`). Snapshot mempertahankan pool, protocol, base fee, range saat open, umur posisi, alias wallet, serta nominal token dan nilai USD untuk alert penutupan.
 
-Enrichment pool (`TVL`, volume 24 jam, dan APR) diambil dari LP Agent hanya saat ada posisi baru, lalu disimpan bersama snapshot. Data tersebut digunakan kembali untuk alert penutupan. Cache in-memory memakai kunci `chain + protocol + pool ID` dengan TTL lima menit.
+Enrichment pool (`TVL`, volume 24 jam, dan APR) diambil dari LP Agent hanya saat ada posisi baru, lalu disimpan bersama snapshot. Data tersebut digunakan kembali untuk alert penutupan. Cache in-memory memakai kunci `chain + protocol + pool ID` dengan TTL lima menit; pool yang tidak ditemukan di-cache hanya 60 detik agar tidak menahan hasil kosong.
+
+Karena kuota LP Agent hanya 5 request per menit, log opening dan overview wallet juga di-cache in-memory per `chain + position ID` dan `chain + owner`. Log opening sebuah posisi tidak berubah selama posisi terbuka, sehingga alert berikutnya tidak memanggil endpoint yang sama lagi.
 
 Pengiriman utama memakai method Telegram `sendRichMessage` dengan rich HTML table. Jika method tersebut ditolak oleh endpoint Bot API, bot memakai pesan teks biasa sebagai fallback agar alert tidak hilang.
 
 Range persentase saat open dipulihkan dari tick bounds dan log opening LP Agent
-(`increase`, `open`, atau `add_liquidity`). Untuk posisi single-sided, range
-dinormalisasi dari boundary pembukaan, misalnya `+0% | -70%`. Jika log historis
-tidak tersedia, bot tetap mengirim alert tetapi menggunakan range saat ini sebagai
-fallback.
+(`increase`, `open`, atau `add_liquidity`). Pada Robinhood Chain (Uniswap V3/V4)
+harga naik searah tick, sehingga batas atas bernilai positif dan batas bawah
+negatif; posisi single-sided dinormalisasi ke boundary pembukaannya, misalnya
+`+0% | -58.4%` untuk deposit all-token1 yang dibuka di batas atas. Jika log
+historis tidak tersedia, bot tetap mengirim alert tetapi menggunakan range saat
+ini sebagai fallback.
+
+Base fee Uniswap V4 diambil dari `poolInfo.fee`; bit tinggi menandai pool dengan
+fee dinamis dan ditampilkan sebagai `Dinamis` alih-alih angka persen palsu.
 
 Beberapa `position_id` yang dibuka atau terdeteksi tertutup bersamaan pada wallet,
 pool, dan protocol yang sama digabung menjadi satu alert logical position dengan

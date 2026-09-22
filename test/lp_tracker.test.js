@@ -221,6 +221,19 @@ test("keeps wallet emoji and win rate on close alerts", async () => {
   assert.match(renderEventHtml(event), /0xaaa\.\.\.aaa/);
 });
 
+test("reads protocol-specific win rate from overview data arrays", async () => {
+  const overview = [
+    { protocol: "uniswap_v3", win_rate: { ALL: 0.625 } },
+    { protocol: "uniswap_v4", win_rate: { ALL: 0.7724615717687812 } },
+  ];
+  const { tracker, client } = makeTracker([apiPosition("p1")], overview);
+  await tracker.register(10, WALLET);
+  client.items = [];
+  const [event] = await tracker.syncAll();
+  assert.equal(event.position.walletWinRate, 77.24615717687812);
+  assert.match(renderEventHtml(event), /77\.2%/);
+});
+
 test("caches pool enrichment and renders TVL, volume, and APR", async () => {
   const originalFetch = globalThis.fetch;
   let calls = 0;
@@ -251,6 +264,50 @@ test("caches pool enrichment and renders TVL, volume, and APR", async () => {
   }
 });
 
+test("serves repeated opening logs and overviews from cache", async () => {
+  const originalFetch = globalThis.fetch;
+  const requested = [];
+  globalThis.fetch = async (url) => {
+    const endpoint = new URL(String(url)).pathname.split("/").pop();
+    requested.push(endpoint);
+    const data = endpoint === "logs" ? [{ action: "open", timestamp: "2026-09-07T05:36:09.000Z" }] : { win_rate: { ALL: 0.5 } };
+    return new Response(JSON.stringify({ status: "success", data }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  try {
+    const client = new LPAgentClient("test-key", { baseUrl: "https://api.test", positionCacheTtlMs: 10_000 });
+    await client.positionLogs("p1", WALLET, "ROBINHOOD");
+    await client.positionLogs("p1", WALLET, "ROBINHOOD");
+    await client.walletOverview(WALLET, "ROBINHOOD");
+    await client.walletOverview(WALLET, "ROBINHOOD");
+    assert.deepEqual(requested, ["logs", "overview"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("retries a pool lookup that returned nothing", async () => {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return new Response(JSON.stringify({ status: "success", data: [] }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  try {
+    // A miss is cached only briefly: the indexer may simply not have the pool
+    // yet, and pinning the null would drop TVL/APR from every later alert.
+    const client = new LPAgentClient("test-key", { baseUrl: "https://api.test" });
+    const position = positionFromApi({ ...apiPosition("p1"), pool: "0xmissing" }, WALLET, "ROBINHOOD");
+    await client.poolMetrics(position);
+    await client.poolMetrics(position);
+    assert.equal(calls, 1);
+    client.poolCache.clear();
+    await client.poolMetrics(position);
+    assert.equal(calls, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("uses opening timestamp for age", () => {
   assert.equal(formatAge("2026-09-22T00:00:00Z", new Date("2026-09-22T02:00:00Z")), "2 jam");
 });
@@ -259,14 +316,63 @@ test("calculates range relative to the opening pool price", () => {
   assert.equal(openingRangeDisplay({ priceRange: [30, 60, 40] }, { price0: 50 }), "-40% to 20%");
 });
 
-test("normalizes single-sided opening range from tick width", () => {
+// Real Robinhood Chain payloads, captured from chain=ROBINHOOD.
+const rhPosition = (overrides = {}) => ({
+  protocol: "uniswap_v3",
+  tickLower: -61080,
+  tickUpper: -58560,
+  tickCurrent: -59974,
+  range: [-61080, -58560, -59974],
+  priceRange: [0.49180187583565105, 0.6327423725067508, 0.5493141029199337],
+  decimal0: 8,
+  decimal1: 9,
+  price0: 1.0635218893066807,
+  price1: 2209.6742343383034,
+  inputToken0: "1471978547858306",
+  inputToken1: "5000000000000",
+  current: { amount0Adjusted: 19434891.11146002, amount1Adjusted: 3808.10805329 },
+  ...overrides,
+});
+
+test("measures Uniswap opening range towards the tick, not away from it", () => {
+  // Opened at price 2503.99 with bounds 0.4918 / 0.6327: the upper bound is
+  // +10.7% away from the opening price and the lower one -14.0%.
+  assert.equal(
+    openingRangeDisplay(rhPosition(), { price0: "0.9707626378872785", price1: "3749.720186193272", tickLower: -61080, tickUpper: -58560 }),
+    "-14% to 10.6%",
+  );
+});
+
+test("treats a Uniswap single-sided deposit as entering at its open bound", () => {
+  // All-token0 means the price opened on the lower bound, so the range has room
+  // above it and none below. The width is the bound-to-bound span: -14% from
+  // the opening price up to +10.6%, i.e. +22.3% of head room.
   assert.equal(
     openingRangeDisplay(
-      { range: [378000, 390250], inputToken0: "100", inputToken1: "0" },
-      { tickLower: 378000, tickUpper: 390250, amount0: "100", amount1: "0" },
+      rhPosition({ inputToken0: "100", inputToken1: "0", current: { amount0Adjusted: 100, amount1Adjusted: 0 } }),
+      { tickLower: -61080, tickUpper: -58560, amount0: "100", amount1: "0", price0: "0.9707626378872785", price1: "3749.720186193272" },
     ),
-    "+0% to -70.6%",
+    "+22.3% to +0%",
   );
+  // All-token1 mirrors it: deposited on the upper bound, so it only has room down.
+  assert.equal(
+    openingRangeDisplay(
+      rhPosition({ inputToken0: "0", inputToken1: "100", current: { amount0Adjusted: 0, amount1Adjusted: 100 } }),
+      { tickLower: -61080, tickUpper: -58560, amount0: "0", amount1: "100", price0: "0.9707626378872785", price1: "3749.720186193272" },
+    ),
+    "+0% to -22.3%",
+  );
+});
+
+test("reports a dynamic Uniswap V4 fee instead of the packed flag", () => {
+  assert.equal(baseFeeDisplay({ protocol: "uniswap_v4", poolInfo: { fee: 8388608 } }), "Dinamis");
+  assert.equal(baseFeeDisplay({ protocol: "uniswap_v3", poolInfo: { fee: 3000 } }), "0.3%");
+});
+
+test("falls back to the current range when the opening log is unavailable", () => {
+  // Without price0/price1 the tick maths cannot run, so the stored position
+  // keeps the current range instead of a mirrored one.
+  assert.equal(openingRangeDisplay(rhPosition(), null), "-10.5% to 15.2%");
 });
 
 test("handles LP Agent rate limits with Retry-After", async () => {
