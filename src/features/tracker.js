@@ -169,7 +169,7 @@ function rangePartsFromPercentList(value) {
 function formatSignedPercent(value) {
   if (value === null || value === undefined || !Number.isFinite(value)) return "-";
   const rounded = Number(value.toFixed(1));
-  return `${rounded > 0 ? "+" : ""}${rounded}%`;
+  return `${rounded >= 0 ? "+" : ""}${rounded}%`;
 }
 
 function rangePartsFromPrices(priceRange, referencePrice) {
@@ -186,6 +186,49 @@ function rangePartsFromPrices(priceRange, referencePrice) {
   const negative = values.filter((item) => item < 0).sort((a, b) => a - b)[0];
   return {
     display: values.length === 1 ? formatPercent(values[0]) : `${formatPercent(lowerPct)} to ${formatPercent(upperPct)}`,
+    plus: positive === undefined ? "-" : formatSignedPercent(positive),
+    minus: negative === undefined ? "-" : formatSignedPercent(negative),
+  };
+}
+
+function openingTickBounds(raw, openingLog) {
+  const source = Array.isArray(raw?.range) ? raw.range : [];
+  const lower = number(openingLog?.tickLower ?? raw?.tickLower ?? source[0]);
+  const upper = number(openingLog?.tickUpper ?? raw?.tickUpper ?? source[1]);
+  if (lower === null || upper === null) return null;
+  return { lower, upper };
+}
+
+function openingAmount(raw, openingLog, index) {
+  const logAmount = number(openingLog?.[`amount${index}`]);
+  if (logAmount !== null) return logAmount;
+  return number(raw?.[`inputToken${index}`]);
+}
+
+function openingRangeFromTicks(raw, openingLog) {
+  const bounds = openingTickBounds(raw, openingLog);
+  if (!bounds) return null;
+  const amount0 = openingAmount(raw, openingLog, 0);
+  const amount1 = openingAmount(raw, openingLog, 1);
+  const hasOnlyOneSide = (amount0 !== null && amount1 !== null)
+    && ((Math.abs(amount0) > 0 && Math.abs(amount1) === 0) || (Math.abs(amount0) === 0 && Math.abs(amount1) > 0));
+  if (hasOnlyOneSide) {
+    const width = (Math.pow(1.0001, bounds.lower - bounds.upper) - 1) * 100;
+    return { display: `+0% to ${formatSignedPercent(width)}`, plus: "+0%", minus: formatSignedPercent(width) };
+  }
+  const price0 = number(openingLog?.price0);
+  const price1 = number(openingLog?.price1);
+  const decimals0 = number(openingLog?.decimal0) ?? number(raw?.decimal0) ?? 18;
+  const decimals1 = number(openingLog?.decimal1) ?? number(raw?.decimal1) ?? 18;
+  if (price0 === null || price1 === null || price0 <= 0 || price1 <= 0) return null;
+  const openingTick = Math.log((price0 / price1) * 10 ** (decimals1 - decimals0)) / Math.log(1.0001);
+  const lowerPct = (Math.pow(1.0001, openingTick - bounds.lower) - 1) * 100;
+  const upperPct = (Math.pow(1.0001, openingTick - bounds.upper) - 1) * 100;
+  const values = [lowerPct, upperPct];
+  const positive = values.filter((item) => item >= 0).sort((a, b) => b - a)[0];
+  const negative = values.filter((item) => item < 0).sort((a, b) => a - b)[0];
+  return {
+    display: `${formatPercent(lowerPct)} to ${formatPercent(upperPct)}`,
     plus: positive === undefined ? "-" : formatSignedPercent(positive),
     minus: negative === undefined ? "-" : formatSignedPercent(negative),
   };
@@ -212,11 +255,15 @@ function currentRangeParts(raw) {
 }
 
 export function openingRangeDisplay(raw, openingLog) {
+  const tickRange = openingRangeFromTicks(raw, openingLog);
+  if (tickRange) return tickRange.display;
   const openingPrice = number(openingLog?.price0);
   return rangeFromPrices(raw?.priceRange, openingPrice);
 }
 
 function openingRangeParts(raw, openingLog) {
+  const tickRange = openingRangeFromTicks(raw, openingLog);
+  if (tickRange) return tickRange;
   return rangePartsFromPrices(raw?.priceRange, number(openingLog?.price0));
 }
 
@@ -230,7 +277,7 @@ function investmentRows(raw) {
   for (const item of candidates) item.usdValue = tokenUsdValue(raw, candidates.indexOf(item), item.amount);
   const totalUsd = candidates.reduce((sum, item) => sum + (item.usdValue ?? 0), 0);
   return candidates
-    .filter((item) => item.amount !== null && Math.abs(item.amount) >= 1e-15)
+    .filter((item) => item.amount !== null)
     .map((item) => ({
       symbol: item.info.symbol,
       amount: item.amount,
@@ -395,7 +442,7 @@ function needsTokenMetadata(position) {
 
 function earliestAddLiquidity(logs) {
   return (Array.isArray(logs) ? logs : [])
-    .filter((log) => String(log?.action ?? "").toLowerCase() === "add_liquidity")
+    .filter((log) => ["add_liquidity", "increase", "open"].includes(String(log?.action ?? "").toLowerCase()))
     .sort((a, b) => (parseTimestamp(a.timestamp)?.getTime() ?? Infinity) - (parseTimestamp(b.timestamp)?.getTime() ?? Infinity))[0] ?? null;
 }
 
@@ -688,11 +735,111 @@ export class LPAgentClient {
   }
 }
 
+function normalizedPoolKey(position) {
+  const id = positionPoolId(position);
+  if (id) return `id:${id.toLowerCase()}`;
+  const pair = String(position?.pool || "")
+    .split("/")
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean)
+    .sort()
+    .join("/");
+  return `pair:${pair}`;
+}
+
+function eventTimestamp(event) {
+  return parseTimestamp(event.eventType === "CLOSED"
+    ? event.closedAt || event.observedAt || event.position?.closedAt
+    : event.position?.openedAt || event.observedAt);
+}
+
+function eventMergeBaseKey(event) {
+  const position = event.position || {};
+  return [
+    event.chatId,
+    String(position.wallet || "").toLowerCase(),
+    position.chain,
+    event.eventType,
+    String(position.protocol || "").toLowerCase(),
+    normalizedPoolKey(position),
+  ].join("|");
+}
+
+function signedRangeValue(value) {
+  if (value === null || value === undefined || value === "-") return null;
+  const parsed = Number.parseFloat(String(value).replace("%", ""));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function mergedRangeParts(positions) {
+  const parts = positions.map((position) => eventRangeParts(position));
+  const plus = parts.map((part) => signedRangeValue(part.plus)).filter((value) => value !== null);
+  const minus = parts.map((part) => signedRangeValue(part.minus)).filter((value) => value !== null);
+  const plusValue = plus.length ? Math.max(...plus) : null;
+  const minusValue = minus.length ? Math.min(...minus) : null;
+  return {
+    plus: plusValue === null ? "-" : formatSignedPercent(plusValue),
+    minus: minusValue === null ? "-" : formatSignedPercent(minusValue),
+  };
+}
+
+function mergeInvestments(positions) {
+  const merged = new Map();
+  for (const position of positions) {
+    for (const item of position.investments || []) {
+      const key = String(item.symbol || "").toLowerCase();
+      const current = merged.get(key) || { ...item, amount: 0, usdValue: 0, hasUsdValue: false };
+      if (Number.isFinite(item.amount)) current.amount += item.amount;
+      if (Number.isFinite(item.usdValue)) {
+        current.usdValue += item.usdValue;
+        current.hasUsdValue = true;
+      }
+      merged.set(key, current);
+    }
+  }
+  const rows = [...merged.values()].map((item) => ({
+    symbol: item.symbol,
+    amount: item.amount,
+    usdValue: item.hasUsdValue ? item.usdValue : null,
+    share: null,
+  }));
+  const totalUsd = rows.reduce((sum, item) => sum + (item.usdValue ?? 0), 0);
+  for (const item of rows) {
+    if (item.usdValue !== null && totalUsd > 0) item.share = (item.usdValue / totalUsd) * 100;
+  }
+  return rows;
+}
+
+function mergePositions(positions) {
+  const first = positions[0];
+  const range = mergedRangeParts(positions);
+  const openedAt = positions
+    .map((position) => parseTimestamp(position.openedAt))
+    .filter(Boolean)
+    .sort((a, b) => a.getTime() - b.getTime())[0];
+  const positionIds = positions.map((position) => position.positionId);
+  const openingRangeDisplay = range.plus !== "-" && range.minus !== "-"
+    ? `${range.minus} to ${range.plus}`
+    : range.plus !== "-" ? range.plus : range.minus;
+  return {
+    ...first,
+    positionId: positionIds.length === 1 ? positionIds[0] : `group:${positionIds.join(",")}`,
+    positionIds,
+    openedAt: openedAt ? openedAt.toISOString() : first.openedAt,
+    openingRangeDisplay: openingRangeDisplay || first.openingRangeDisplay,
+    openingRangePlus: range.plus,
+    openingRangeMinus: range.minus,
+    rangeSource: "grouped_opening_ranges",
+    investments: mergeInvestments(positions),
+  };
+}
+
 export class LPTracker {
-  constructor(client, store, logger = () => {}) {
+  constructor(client, store, logger = () => {}, { mergeWindowMs = 60_000 } = {}) {
     this.client = client;
     this.store = store;
     this.logger = logger;
+    this.mergeWindowMs = mergeWindowMs;
     this.syncing = false;
   }
 
@@ -753,6 +900,7 @@ export class LPTracker {
     const positions = current || await this.client.openingPositions(wallet.address, wallet.chain);
     const currentById = new Map(positions.map((position) => [position.positionId, position]));
     const existing = this.store.positions(wallet);
+    const observedAt = nowIso();
     let walletWinRate;
     let overviewLoaded = false;
     const loadWalletWinRate = async () => {
@@ -798,6 +946,7 @@ export class LPTracker {
             walletEmoji: wallet.emoji,
             walletWinRate: winRate,
           },
+          observedAt,
         });
       }
     }
@@ -809,10 +958,39 @@ export class LPTracker {
         const winRate = (await loadWalletWinRate()) ?? enriched.walletWinRate;
         const eventPosition = { ...enriched, walletName: wallet.name, walletEmoji: wallet.emoji, walletWinRate: winRate };
         this.store.savePosition(wallet, eventPosition);
-        events.push({ chatId: wallet.chatId, eventType: "OPENED", position: eventPosition });
+        events.push({ chatId: wallet.chatId, eventType: "OPENED", position: eventPosition, observedAt });
       }
     }
-    return emitEvents ? events : [];
+    return emitEvents ? this.mergeEvents(events) : [];
+  }
+
+  mergeEvents(events) {
+    const groupsByBase = new Map();
+    for (const event of events) {
+      const baseKey = eventMergeBaseKey(event);
+      const timestamp = eventTimestamp(event)?.getTime() ?? null;
+      const candidates = groupsByBase.get(baseKey) || [];
+      let group = candidates.find((candidate) => {
+        if (timestamp === null || candidate.minTimestamp === null) return true;
+        return Math.abs(timestamp - candidate.minTimestamp) <= this.mergeWindowMs;
+      });
+      if (!group) {
+        group = { events: [], minTimestamp: timestamp };
+        candidates.push(group);
+        groupsByBase.set(baseKey, candidates);
+      }
+      group.events.push(event);
+      if (timestamp !== null && (group.minTimestamp === null || timestamp < group.minTimestamp)) group.minTimestamp = timestamp;
+    }
+    return [...groupsByBase.values()].flatMap((groups) => groups.map((group) => {
+      if (group.events.length === 1) return group.events[0];
+      const first = group.events[0];
+      return {
+        ...first,
+        position: mergePositions(group.events.map((event) => event.position)),
+        positionIds: group.events.flatMap((event) => event.position.positionIds || [event.position.positionId]),
+      };
+    }));
   }
 }
 

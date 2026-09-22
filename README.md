@@ -66,4 +66,16 @@ Enrichment pool (`TVL`, volume 24 jam, dan APR) diambil dari LP Agent hanya saat
 
 Pengiriman utama memakai method Telegram `sendRichMessage` dengan rich HTML table. Jika method tersebut ditolak oleh endpoint Bot API, bot memakai pesan teks biasa sebagai fallback agar alert tidak hilang.
 
-Range persentase saat open dipulihkan dari log `add_liquidity` LP Agent. Jika log historis tidak tersedia, bot tetap mengirim alert tetapi menggunakan range saat ini sebagai fallback.
+Range persentase saat open dipulihkan dari tick bounds dan log opening LP Agent
+(`increase`, `open`, atau `add_liquidity`). Untuk posisi single-sided, range
+dinormalisasi dari boundary pembukaan, misalnya `+0% | -70%`. Jika log historis
+tidak tersedia, bot tetap mengirim alert tetapi menggunakan range saat ini sebagai
+fallback.
+
+Beberapa `position_id` yang dibuka atau terdeteksi tertutup bersamaan pada wallet,
+pool, dan protocol yang sama digabung menjadi satu alert logical position dengan
+jendela waktu default 60 detik. Snapshot tiap `position_id` tetap disimpan untuk
+deteksi berikutnya. Nominal token dijumlahkan lalu persentase dihitung ulang;
+range gabungan memakai batas terluar opening range (plus terbesar dan minus
+terkecil), sehingga single-sided seperti `+0% | -70%` tetap ditampilkan dengan
+benar.

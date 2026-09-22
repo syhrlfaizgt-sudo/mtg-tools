@@ -85,12 +85,47 @@ test("new position emits one OPENED event", async () => {
   assert.deepEqual(await tracker.syncAll(), []);
 });
 
+test("merges simultaneous positions from the same pool into one OPENED event", async () => {
+  const { tracker, client } = makeTracker([apiPosition("baseline")]);
+  await tracker.register(10, WALLET);
+  const first = apiPosition("p1");
+  const second = apiPosition("p2");
+  for (const raw of [first, second]) {
+    raw.pool = "0xnautilo-pool";
+    raw.priceRange = [0.3, 1, 1];
+    raw.inputValueUsd0 = 73.2;
+    raw.inputValueUsd1 = 1.81;
+  }
+  client.items.push(first, second);
+  const [event] = await tracker.syncAll();
+  assert.equal(event.eventType, "OPENED");
+  assert.deepEqual(event.positionIds, ["p1", "p2"]);
+  assert.equal(event.position.investments[0].amount, 0.0528);
+  assert.equal(event.position.investments[1].amount, 22152.6);
+  assert.equal(event.position.investments.reduce((sum, item) => sum + item.share, 0).toFixed(2), "100.00");
+  assert.match(renderEventText(event), /Range \| \+0% \| -70%/);
+});
+
 test("missing position emits one CLOSED event", async () => {
   const { tracker, client } = makeTracker([apiPosition("p1")]);
   await tracker.register(10, WALLET);
   client.items = [];
   assert.deepEqual((await tracker.syncAll()).map((event) => [event.eventType, event.position.positionId]), [["CLOSED", "p1"]]);
   assert.deepEqual(await tracker.syncAll(), []);
+});
+
+test("merges simultaneous positions from the same pool into one CLOSED event", async () => {
+  const first = apiPosition("p1");
+  const second = apiPosition("p2");
+  first.pool = "0xnautilo-pool";
+  second.pool = "0xnautilo-pool";
+  const { tracker, client } = makeTracker([first, second]);
+  await tracker.register(10, WALLET);
+  client.items = [];
+  const [event] = await tracker.syncAll();
+  assert.equal(event.eventType, "CLOSED");
+  assert.deepEqual(event.positionIds, ["p1", "p2"]);
+  assert.equal(event.position.investments[0].amount, 0.0528);
 });
 
 test("restart preserves deduplication", async () => {
@@ -102,10 +137,12 @@ test("restart preserves deduplication", async () => {
   assert.deepEqual(await restarted.syncAll(), []);
 });
 
-test("single-sided investment omits zero token", () => {
+test("single-sided investment preserves zero token for aggregation", () => {
   const raw = apiPosition("p1");
   raw.inputToken1 = "0";
-  assert.deepEqual(positionFromApi(raw, WALLET, "ROBINHOOD").investments.map((item) => item.symbol), ["WETH"]);
+  const investments = positionFromApi(raw, WALLET, "ROBINHOOD").investments;
+  assert.deepEqual(investments.map((item) => item.symbol), ["WETH", "musebook"]);
+  assert.equal(investments[1].amount, 0);
 });
 
 test("renders rich alert with exact investment shares", () => {
@@ -211,6 +248,16 @@ test("uses opening timestamp for age", () => {
 
 test("calculates range relative to the opening pool price", () => {
   assert.equal(openingRangeDisplay({ priceRange: [30, 60, 40] }, { price0: 50 }), "-40% to 20%");
+});
+
+test("normalizes single-sided opening range from tick width", () => {
+  assert.equal(
+    openingRangeDisplay(
+      { range: [378000, 390250], inputToken0: "100", inputToken1: "0" },
+      { tickLower: 378000, tickUpper: 390250, amount0: "100", amount1: "0" },
+    ),
+    "+0% to -70.6%",
+  );
 });
 
 test("handles LP Agent rate limits with Retry-After", async () => {
